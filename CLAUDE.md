@@ -105,4 +105,6 @@ simulation.
   only the standard library).
 - `Makefile` — `make test` (pytest), `make lint` (ruff), `make run-scenario`
   (runs the M2 normal-day scenario); `make run-dashboard` is a stub until the
-  dashboard (M4/M9) exists.
+  dashboard (M4/M9) exists. Native Windows PowerShell usually does not ship
+  with `make`, so Windows users should run the equivalent `uv run ...` commands
+  directly instead of `make`.

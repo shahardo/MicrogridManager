@@ -47,12 +47,32 @@ Requires Python 3.11+ and [`uv`](https://docs.astral.sh/uv/). All dependencies
 are installed into a project-local virtual environment (`.venv`) — nothing is
 installed globally.
 
+The repository includes a `Makefile`, but on native Windows PowerShell the
+`make` command is often not installed. In that environment, run the underlying
+`uv` commands directly instead of `make`.
+
+### macOS / Linux
+
 ```bash
 uv sync --group dev   # creates .venv and installs dependencies
-make test              # run the test suite (uv run pytest)
-make lint               # run the linter (uv run ruff check .)
-make run-scenario       # run the "normal day" simulation, writes output/normal_day.csv
+make test              # runs the test suite via uv run pytest
+make lint               # runs ruff via uv run ruff check .
+make run-scenario       # runs the "normal day" simulation and writes output/normal_day.csv
 ```
+
+### Windows PowerShell
+
+```powershell
+uv sync --group dev   # creates .venv and installs dependencies
+uv run pytest         # run the test suite
+uv run ruff check .   # run the linter
+uv run python -m simulation.runner  # run the "normal day" scenario
+```
+
+If you want to use `make` on Windows, install a GNU Make implementation (for
+example via Git Bash, WSL, or a package manager such as `winget`/`choco`/`scoop`).
+Native PowerShell does not include `make` by default, so `make test` may fail with
+"The term 'make' is not recognized."
 
 ## Running a simulation scenario
 
