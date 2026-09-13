@@ -33,13 +33,14 @@ implementation roadmap.
 
 ## Status
 
-**Implementation in progress (Phase 1, M2 — simulated adapters).** The
+**Implementation in progress (Phase 1, M3 — local telemetry store).** The
 architecture and Phase 1 plan are defined (see `docs/architecture.md` §6 and
 `docs/phase-1-dev-plan.md`). M1 delivered the canonical asset model and
-`AssetAdapter` interface; M2 adds simulated PV, battery (BESS), controllable
+`AssetAdapter` interface; M2 added simulated PV, battery (BESS), controllable
 load, and diesel/gas generator adapters plus a shared discrete-time
 simulation clock, and a scripted "normal day" scenario that exercises them
-end-to-end.
+end-to-end; M3 adds a durable, queryable telemetry store — every scenario run
+is now recorded and inspectable after the fact.
 
 ## Development setup
 
@@ -76,11 +77,11 @@ Native PowerShell does not include `make` by default, so `make test` may fail wi
 
 ## Running a simulation scenario
 
-`make run-scenario` (or `uv run python -m simulation.runner`) steps a
-scripted 24-hour "normal day" through the M2 simulated adapters — rooftop
-PV, a battery, a household-shaped load, and a backup generator — using a
-fixed self-consumption control rule (charge the battery from excess solar,
-discharge to cover shortfalls, fall back to the generator only if the
+`make run-scenario` (or, on Windows, `uv run python -m simulation.runner`)
+steps a scripted 24-hour "normal day" through the M2 simulated adapters —
+rooftop PV, a battery, a household-shaped load, and a backup generator —
+using a fixed self-consumption control rule (charge the battery from excess
+solar, discharge to cover shortfalls, fall back to the generator only if the
 battery can't keep up). This is not the real dispatch engine (that lands in
 M7) — it exists purely to produce visible, inspectable output from the
 simulated physics.
@@ -88,8 +89,26 @@ simulated physics.
 The run writes a CSV time series (default `output/normal_day.csv`) with
 each step's PV/load/battery/generator power, battery state of charge, and
 cumulative generator fuel use — open it in a spreadsheet or plotting tool to
-see the day play out. Options: `--scenario`, `--step-seconds`,
-`--duration-hours`, `--output`.
+see the day play out. It also records every one of those readings into the
+M3 telemetry store (default `output/telemetry.db`) for later inspection —
+see "Querying telemetry" below. Options: `--scenario`, `--step-seconds`,
+`--duration-hours`, `--output`, `--telemetry-db`, `--run-id`.
+
+## Querying telemetry
+
+Every recorded run can be inspected after the fact with
+`scripts/query_telemetry.py` — called with no `--run-id` it lists the runs
+available; with `--run-id` alone it lists that run's series; with both
+`--run-id` and `--series` it prints that series' time series.
+
+```bash
+make query-telemetry                                            # list recorded runs
+make query-telemetry ARGS="--run-id <run>"                       # list that run's series
+make query-telemetry ARGS="--run-id <run> --series pv_power_w"   # print a series
+```
+
+On Windows PowerShell, run the script directly instead of through `make`,
+e.g. `uv run python scripts/query_telemetry.py --run-id <run> --series pv_power_w`.
 
 ## Development conventions
 

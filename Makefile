@@ -1,4 +1,4 @@
-.PHONY: test lint run-dashboard run-scenario
+.PHONY: test lint run-dashboard run-scenario query-telemetry
 
 test:
 	uv run pytest
@@ -11,3 +11,6 @@ run-dashboard:
 
 run-scenario:
 	uv run python -m simulation.runner
+
+query-telemetry:
+	uv run python scripts/query_telemetry.py $(ARGS)

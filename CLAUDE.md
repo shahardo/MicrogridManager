@@ -11,7 +11,7 @@ a single microgrid to utility-wide orchestration of many microgrids, unifies rea
 hardware control and simulation behind one control interface, and assumes
 multi-tenant ownership with intermittent connectivity between tiers.
 
-Current status: Phase 1 implementation, M2 (simulated adapters) complete;
+Current status: Phase 1 implementation, M3 (local telemetry store) complete;
 following the phased roadmap in `docs/architecture.md` §6 and
 `docs/phase-1-dev-plan.md`, starting with a single-site controller +
 simulation.
@@ -79,8 +79,30 @@ simulation.
     dead-band). This is *not* the real dispatch engine (M7) — it exists only
     to exercise the M2 adapters end-to-end.
   - `runner.py` — CLI: `--scenario`, `--step-seconds`, `--duration-hours`,
-    `--output`; writes the scenario's per-step readings to CSV
-    (`output/normal_day.csv` by default; `output/` is gitignored).
+    `--output`, `--telemetry-db`, `--run-id`; writes the scenario's per-step
+    readings to CSV (`output/normal_day.csv` by default; `output/` is
+    gitignored) **and** records every non-timestamp field of every row into
+    the M3 `TelemetryStore` under an auto-generated (or `--run-id`-supplied)
+    run id (`output/telemetry.db` by default). `record_telemetry()` is the
+    one place that translates a scenario's row-dict output into telemetry
+    samples — the scenario/adapter code itself stays telemetry-agnostic.
+- `src/microgridmanager/telemetry/store.py` — **the M3 append-only telemetry
+  store** (`TelemetryStore`, `TelemetrySample`). SQLite-backed, long/narrow
+  schema (`run_id`, `timestamp`, `asset_id` (nullable), `series`, `value`) —
+  one row per metric per timestamp, nothing ever updated in place, so new
+  series (protection state, forecasts, dispatch decisions) never need a
+  schema change. `record()`/`record_many()` to write; `query()` (filterable
+  by `asset_id`/time range), `list_runs()`, `list_series()` to read. Reopening
+  a `TelemetryStore` on the same file after the process exits sees everything
+  previously written — verified by
+  `tests/unit/telemetry/test_store.py::test_persistence_survives_reopen`.
+  **Every milestone from here on should write through this store** rather
+  than inventing a parallel persistence mechanism.
+- `scripts/query_telemetry.py` — **M3's visible result**: CLI over the
+  telemetry store. No `--run-id` lists runs; `--run-id` alone lists that
+  run's series; `--run-id` + `--series` (optionally + `--asset-id`) prints
+  that series' time series table. Also runnable via `make query-telemetry
+  ARGS="--run-id ... --series ..."`.
 - `tests/` — `unit/`, `integration/`, `scenarios/`.
   - `tests/unit/adapters/` — the **adapter contract test suite**: `fakes.py`
     (minimal in-memory test-double adapters), `contracts.py` (reusable
@@ -100,11 +122,12 @@ simulation.
     monotonic, CSV round-trips correctly).
 - `pyproject.toml` — project config; dependencies managed with `uv`
   (`uv sync --group dev` creates `.venv` and installs everything — never
-  install packages globally). No new runtime dependencies were added for M2
-  (kept dependency-light per the project's zero-ops bias — CSV output uses
-  only the standard library).
+  install packages globally). No new runtime dependencies were added through
+  M3 (kept dependency-light per the project's zero-ops bias — CSV output and
+  the telemetry store use only the standard library, `csv` and `sqlite3`).
 - `Makefile` — `make test` (pytest), `make lint` (ruff), `make run-scenario`
-  (runs the M2 normal-day scenario); `make run-dashboard` is a stub until the
-  dashboard (M4/M9) exists. Native Windows PowerShell usually does not ship
-  with `make`, so Windows users should run the equivalent `uv run ...` commands
-  directly instead of `make`.
+  (runs the M2 normal-day scenario, now also recording to the M3 telemetry
+  store), `make query-telemetry ARGS="..."` (M3's CLI); `make run-dashboard`
+  is a stub until the dashboard (M4/M9) exists. Native Windows PowerShell
+  usually does not ship with `make`, so Windows users should run the
+  equivalent `uv run ...` commands directly instead of `make`.
