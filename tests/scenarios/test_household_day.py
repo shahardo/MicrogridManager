@@ -1,10 +1,14 @@
-"""M4 exit-criteria test: the six-device household scenario runs a full
-simulated day without errors and produces plausible, inspectable output."""
+"""M4/M5 exit-criteria tests: the six-device household scenario runs a full
+simulated day without errors and produces plausible, inspectable output, and
+a scripted grid outage exercises the M5 protection state machine end to
+end."""
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
+from microgridmanager.protection import PROTECTION_STATE_CODES, ProtectionState
 from simulation.runner import write_csv
 from simulation.scenarios import household_day
 
@@ -88,6 +92,65 @@ def test_ev_charger_keeps_plugging_in_on_later_days() -> None:
         for day in range(5)
     ]
     assert any(per_day_charging[1:]), "EV should still be charging on days after the first"
+
+
+def test_outage_triggers_islanding_black_start_and_restoration() -> None:
+    """M5 exit-criteria test: a scripted grid outage produces a coherent
+    protection-state sequence — NORMAL -> ISLANDING_TRANSITION -> ISLANDED
+    -> BLACK_START -> RESTORATION -> NORMAL — sheds non-critical loads before
+    the critical household load, and restores everything once the grid
+    returns. The outage window (hour 1 to hour 5) ends before dawn, so the
+    only thing driving the black-start recovery is the grid returning, not a
+    marginal PV-vs-demand crossing (that transition is covered, without the
+    inherent real-world chatter of two independently-varying signals staying
+    close for an extended stretch, by the state machine's own unit tests)."""
+    start = household_day.DEFAULT_START
+    outage_start = start + timedelta(hours=1)
+    outage_end = start + timedelta(hours=5)
+    grid_connected_at = household_day.grid_outage_between(outage_start, outage_end)
+
+    rows = household_day.run(
+        step_seconds=300.0, duration_hours=8.0, grid_connected_at=grid_connected_at
+    )
+
+    code = {state: PROTECTION_STATE_CODES[state] for state in ProtectionState}
+    states_in_order = [row["protection_state"] for row in rows]
+    distinct_in_order = [
+        s for i, s in enumerate(states_in_order) if i == 0 or s != states_in_order[i - 1]
+    ]
+
+    assert distinct_in_order == [
+        code[ProtectionState.NORMAL],
+        code[ProtectionState.ISLANDING_TRANSITION],
+        code[ProtectionState.ISLANDED],
+        code[ProtectionState.BLACK_START],
+        code[ProtectionState.RESTORATION],
+        code[ProtectionState.NORMAL],
+    ]
+
+    # No power crosses the PCC at all while the state machine has decided the
+    # grid is unavailable (islanding transition through black start).
+    disconnected_states = {
+        code[ProtectionState.ISLANDING_TRANSITION],
+        code[ProtectionState.ISLANDED],
+        code[ProtectionState.BLACK_START],
+    }
+    for row in rows:
+        if row["protection_state"] in disconnected_states:
+            assert row["grid_power_w"] == 0.0
+
+    # Every load is shed at some point during the outage (black start sheds
+    # everything, including the critical household load)...
+    assert any(row["household_load_served"] == 0.0 for row in rows)
+    assert any(row["ev_charger_served"] == 0.0 for row in rows)
+    assert any(row["water_heater_served"] == 0.0 for row in rows)
+
+    # ...and every load is back in service once the grid has been restored.
+    final_row = rows[-1]
+    assert final_row["protection_state"] == code[ProtectionState.NORMAL]
+    assert final_row["household_load_served"] == 1.0
+    assert final_row["ev_charger_served"] == 1.0
+    assert final_row["water_heater_served"] == 1.0
 
 
 def test_write_csv_produces_a_readable_file_with_all_rows(tmp_path: Path) -> None:

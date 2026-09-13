@@ -71,6 +71,45 @@ def test_tank_energy_stays_within_bounds() -> None:
         assert 0.0 <= heater.get_state().tank_energy_fraction <= 1.0
 
 
+def test_shed_forces_heating_off_even_below_low_threshold() -> None:
+    heater = SimulatedWaterHeaterAdapter(
+        "wh-1",
+        capacity_wh=1_000.0,
+        rated_power_w=1_000.0,
+        initial_tank_fraction=0.5,
+        low_fraction=0.4,
+        high_fraction=0.9,
+        draw_profile=lambda _at: 2_000.0,
+    )
+    heater.set_shed(True)
+    heater.step(3600.0)  # would normally drop below low_fraction and start heating
+
+    state = heater.get_state()
+    assert state.heating is False
+    assert state.active_power_w == 0.0
+    # The tank still depletes from the draw even while shed.
+    assert state.tank_energy_fraction < 0.5
+
+
+def test_unshedding_resumes_normal_hysteresis_control() -> None:
+    heater = SimulatedWaterHeaterAdapter(
+        "wh-1",
+        capacity_wh=1_000.0,
+        rated_power_w=1_000.0,
+        initial_tank_fraction=0.5,
+        low_fraction=0.4,
+        high_fraction=0.9,
+        draw_profile=lambda _at: 2_000.0,
+    )
+    heater.set_shed(True)
+    heater.step(3600.0)
+    assert heater.get_state().heating is False
+
+    heater.set_shed(False)
+    heater.step(3600.0)
+    assert heater.get_state().heating is True
+
+
 def test_timestamp_reflects_shared_clock() -> None:
     clock = SimulationClock()
     heater = SimulatedWaterHeaterAdapter("wh-1", clock=clock)

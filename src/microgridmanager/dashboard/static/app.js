@@ -1,5 +1,16 @@
 const COLORS = ["#2563eb", "#16a34a", "#dc2626", "#9333ea", "#ea580c", "#0891b2", "#64748b"];
 
+// Mirrors microgridmanager.protection.state_machine.PROTECTION_STATE_CODES —
+// telemetry/JSON can only carry numbers, so the state is decoded back to a
+// label here rather than sent as a string.
+const PROTECTION_STATE_LABELS = {
+  0: "grid-connected (normal)",
+  1: "islanding transition",
+  2: "islanded",
+  3: "black start",
+  4: "restoration",
+};
+
 const state = {
   mode: "live",
   liveTimer: null,
@@ -91,15 +102,16 @@ function renderCards(row) {
       ["SoC headroom", fmtPct(row.battery_soc_headroom)],
       ["Charge rule output", fmtW(row.charge_rule_output_w)],
     ]),
-    card("Connection state (placeholder, M5 replaces this)", [
+    card("Protection state machine (M5)", [
       [
-        "Indicator",
-        row.grid_connected === undefined
+        "State",
+        row.protection_state === undefined
           ? "n/a"
-          : row.grid_connected
-            ? "grid-connected"
-            : "islanded (manual)",
+          : (PROTECTION_STATE_LABELS[row.protection_state] ?? row.protection_state),
       ],
+      ["Household load", row.household_load_served ? "served" : "shed"],
+      ["Water heater", row.water_heater_served ? "served" : "shed"],
+      ["EV charger", row.ev_charger_served ? "served" : "shed"],
     ]),
   ].join("");
 }
@@ -236,6 +248,17 @@ function renderCharts(rows) {
     seriesFromRows(rows, "household_load_power_w", "Load actual", COLORS[2]),
     seriesFromRows(rows, "household_load_power_forecast_w", "Load forecast", "#fca5a5"),
   ]);
+
+  drawLineChart(
+    document.getElementById("chart-protection"),
+    [
+      seriesFromRows(rows, "protection_state", "State (0=normal..4=restoration)", COLORS[6]),
+      seriesFromRows(rows, "household_load_served", "Household served", COLORS[2]),
+      seriesFromRows(rows, "water_heater_served", "Water heater served", COLORS[4]),
+      seriesFromRows(rows, "ev_charger_served", "EV served", COLORS[3]),
+    ],
+    { yMin: 0, yMax: 4 },
+  );
 }
 
 async function pollLive() {

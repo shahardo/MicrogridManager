@@ -6,13 +6,20 @@ durable run) — `make run-scenario` (or `python -m simulation.runner`) steps
 the simulated PV/battery/load/generator adapters through a scripted day and
 leaves both a CSV any spreadsheet/plotting tool can open, and a telemetry run
 `scripts/query_telemetry.py` can inspect.
+
+`--outage-start-hour`/`--outage-duration-hours` (household_day only) script
+an M5 grid outage, so a single CLI run demonstrates the protection state
+machine's full outage/black-start/restoration sequence — e.g.:
+`make run-scenario ARGS="--scenario household_day --outage-start-hour 1
+--outage-duration-hours 4"`, then inspect the `protection_state`/
+`*_served` series with `scripts/query_telemetry.py`.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from microgridmanager.telemetry import TelemetrySample, TelemetryStore
@@ -62,10 +69,38 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--telemetry-db", type=Path, default=DEFAULT_TELEMETRY_DB)
     parser.add_argument("--run-id", default=None)
+    parser.add_argument(
+        "--outage-start-hour",
+        type=float,
+        default=None,
+        help="Hour into the run to disconnect the grid (household_day only; M5).",
+    )
+    parser.add_argument(
+        "--outage-duration-hours",
+        type=float,
+        default=None,
+        help="How long the scripted outage lasts (requires --outage-start-hour).",
+    )
     args = parser.parse_args(argv)
 
     run_scenario = SCENARIOS[args.scenario]
-    rows = run_scenario(step_seconds=args.step_seconds, duration_hours=args.duration_hours)
+    run_kwargs: dict = {"step_seconds": args.step_seconds, "duration_hours": args.duration_hours}
+
+    if args.outage_start_hour is not None or args.outage_duration_hours is not None:
+        if args.scenario != "household_day":
+            parser.error(
+                "--outage-start-hour/--outage-duration-hours require --scenario household_day"
+            )
+        if args.outage_start_hour is None or args.outage_duration_hours is None:
+            parser.error("--outage-start-hour and --outage-duration-hours must be given together")
+        start = household_day.DEFAULT_START
+        outage_start = start + timedelta(hours=args.outage_start_hour)
+        outage_end = outage_start + timedelta(hours=args.outage_duration_hours)
+        run_kwargs["grid_connected_at"] = household_day.grid_outage_between(
+            outage_start, outage_end
+        )
+
+    rows = run_scenario(**run_kwargs)
 
     output_path = args.output or (DEFAULT_OUTPUT_DIR / f"{args.scenario}.csv")
     write_csv(rows, output_path)

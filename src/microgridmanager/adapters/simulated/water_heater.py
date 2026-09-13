@@ -7,6 +7,12 @@ cycles on/off with hysteresis — turning on once the tank drops below
 `low_fraction` and staying on until it reaches `high_fraction` — like a real
 thermostatically-controlled element, rather than turning on/off exactly at
 one threshold (which would chatter every step).
+
+`set_shed(True)` forces the element off regardless of hysteresis — this
+adapter has no `PowerControllable` setpoint to override (it manages its own
+heating decision), so M5's protection layer sheds it this way instead, the
+same as cutting power at the breaker. The tank keeps depleting from hot-water
+draws either way; only reheating is disabled.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ class SimulatedWaterHeaterAdapter(AssetAdapter):
         self._draw_profile = draw_profile or household_water_draw_profile()
         self._tank_energy_wh = capacity_wh * initial_tank_fraction
         self._heating = False
+        self._shed = False
 
     @property
     def asset_id(self) -> str:
@@ -65,14 +72,23 @@ class SimulatedWaterHeaterAdapter(AssetAdapter):
             heating=self._heating,
         )
 
+    def set_shed(self, shed: bool) -> None:
+        """M5's protection layer calls this before `step()` to force the
+        element off (`shed=True`) regardless of hysteresis, or to release it
+        back to normal hysteresis control (`shed=False`)."""
+        self._shed = shed
+
     def step(self, dt_seconds: float) -> None:
         """Advance one tick: deplete the tank by this step's hot-water draw,
-        update the hysteresis heating state, then replenish it if heating."""
+        update the hysteresis heating state (unless shed), then replenish it
+        if heating."""
         dt_hours = dt_seconds / 3600.0
         draw_w = max(0.0, self._draw_profile(self._clock.now))
         self._tank_energy_wh -= draw_w * dt_hours
 
-        if self.tank_energy_fraction <= self._low_fraction:
+        if self._shed:
+            self._heating = False
+        elif self.tank_energy_fraction <= self._low_fraction:
             self._heating = True
         elif self.tank_energy_fraction >= self._high_fraction:
             self._heating = False

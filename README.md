@@ -33,16 +33,20 @@ implementation roadmap.
 
 ## Status
 
-**Implementation in progress (Phase 1, M4 — extended simulated environment &
-dashboard, with replay).** The architecture and Phase 1 plan are defined (see
+**Implementation in progress (Phase 1, M5 — protection & control state
+machine).** The architecture and Phase 1 plan are defined (see
 `docs/architecture.md` §6 and `docs/phase-1-dev-plan.md`). M1 delivered the
 canonical asset model and `AssetAdapter` interface; M2 added simulated PV,
 battery (BESS), controllable load, and diesel/gas generator adapters plus a
 shared discrete-time simulation clock, and a scripted "normal day" scenario
 that exercises them end-to-end; M3 added a durable, queryable telemetry
-store; M4 adds an EV charger, a water heater, and a grid connection (with a
+store; M4 added an EV charger, a water heater, and a grid connection (with a
 time-of-use tariff) as three more simulated devices, a six-device "household
-day" scenario combining all of them, and a live/replay web dashboard.
+day" scenario combining all of them, and a live/replay web dashboard; M5
+adds the safety-critical protection state machine — islanding detection,
+black start, and priority-ordered load shedding — in front of it all, driven
+either by the dashboard's grid connect/disconnect toggle or a scripted
+outage.
 
 ## Development setup
 
@@ -87,22 +91,41 @@ scenarios are available (`--scenario`, default `normal_day`):
   a backup generator, using a fixed self-consumption control rule (charge the
   battery from excess solar, discharge to cover shortfalls, fall back to the
   generator only if the battery can't keep up).
-- **`household_day`** (M4) — the same PV/battery/household load, plus an EV
-  charger (plugs in every evening for the night, auto-charges toward a
+- **`household_day`** (M4/M5) — the same PV/battery/household load, plus an
+  EV charger (plugs in every evening for the night, auto-charges toward a
   target state of charge by the morning, and uses a commute's worth of
   energy each day it's away — so it keeps needing a real charge indefinitely,
   not just on the scenario's first day), a water heater (a virtual tank that
   depletes against a morning/evening hot-water draw and cycles its heating
   element to reheat), and a grid connection with a time-of-use tariff,
-  absorbing whatever import/export is left over after the battery.
+  absorbing whatever import/export is left over after the battery — unless
+  the M5 protection layer has decided the grid is unavailable, in which case
+  nothing crosses the connection at all (see below).
 
-Neither is the real dispatch engine (that lands in M7) — they exist purely to
-produce visible, inspectable output from the simulated physics.
+Neither runs the real dispatch engine (that lands in M7) — they exist purely
+to produce visible, inspectable output from the simulated physics.
 
 ```bash
 make run-scenario                                    # normal_day (default)
-make run-scenario ARGS="--scenario household_day"     # the M4 six-device scenario
+make run-scenario ARGS="--scenario household_day"     # the M4/M5 six-device scenario
 ```
+
+### Scripting a grid outage (M5)
+
+`household_day` can simulate a grid outage, driving the protection state
+machine through islanding, load shedding, a possible black start, and
+restoration once the grid returns:
+
+```bash
+make run-scenario ARGS="--scenario household_day --outage-start-hour 1 --outage-duration-hours 4"
+```
+
+This disconnects the grid 1 hour into the run for 4 hours. Inspect the
+result with `scripts/query_telemetry.py` (see "Querying telemetry" below) —
+look at the `protection_state` series (0=normal, 1=islanding transition,
+2=islanded, 3=black start, 4=restoration) and the `household_load_served`/
+`water_heater_served`/`ev_charger_served` series to see exactly what was
+shed and when it came back.
 
 The run writes a CSV time series (default `output/<scenario>.csv`) with every
 device's power/status each step — open it in a spreadsheet or plotting tool
@@ -136,20 +159,23 @@ e.g. `uv run python scripts/query_telemetry.py --run-id <run> --series pv_power_
 
 - **Live mode** runs the six-device scenario in the background — Start/
   Pause/Reset controls, a speed multiplier, and a manual grid connect/
-  disconnect toggle (a placeholder for now; M5 wires it to the real
-  protection state machine) — showing each device's status card and live
-  power/storage-level/tariff/forecast charts as it plays out. Every live tick
-  is also recorded to the telemetry store, so a live session can be replayed
-  later exactly like any other run.
+  disconnect toggle that (since M5) is real: switching it off actually
+  islands the site, sheds loads by priority, and can drive a black start —
+  showing each device's status card, the protection state and which loads
+  are currently served or shed, and live power/storage-level/tariff/
+  forecast/protection charts as it plays out. Every live tick is also
+  recorded to the telemetry store, so a live session can be replayed later
+  exactly like any other run.
 - **Replay mode** lists every run recorded in the telemetry store (from
   `make run-scenario` or a previous live session) and lets you play/pause/
   seek/speed through it using the same device cards and charts.
 
-The forecast panel and the "decision variables" panel (current/projected
-tariff price, battery SoC headroom, the self-consumption rule's output, the
-grid-connect indicator) ship with small inline placeholders standing in for
-the real forecasting (M6) and dispatch (M7) engines, which don't exist yet —
-those milestones swap in real data without changing the panels.
+The forecast panel and the "decision variables" panel's battery/tariff cards
+(current/projected tariff price, battery SoC headroom, the self-consumption
+rule's output) ship with small inline placeholders standing in for the real
+forecasting (M6) and dispatch (M7) engines, which don't exist yet — those
+milestones swap in real data without changing the panels. The protection
+state card next to them is real, not a placeholder, as of M5.
 
 Options: `--host`, `--port`, `--telemetry-db`, `--step-seconds`.
 

@@ -72,17 +72,20 @@ class SimulationEngine:
         self.speed = speed
 
     def set_grid_connected(self, connected: bool) -> None:
-        """Manual grid connect/disconnect toggle (M4 controls panel). No
-        physical effect yet — it's the input signal the M5 protection state
-        machine will consume; for now it only drives the placeholder
-        grid-connect/island indicator."""
+        """Manual grid connect/disconnect toggle (M4 controls panel). Since
+        M5, this is the real input signal the protection state machine
+        consumes each tick — toggling it off actually islands the site,
+        sheds loads by priority, and can drive a black start."""
         self.grid_connected = connected
 
     def tick(self) -> dict:
         """Advance one control step and return this step's reading (the same
-        row shape `household_day.step_scenario` produces, plus the M4
-        dashboard's placeholder forecast/decision-variable fields)."""
-        row = household_day.step_scenario(self.assets, self._step_seconds)
+        row shape `household_day.step_scenario` produces — including its
+        real `protection_state`/`*_served` fields — plus the M4 dashboard's
+        remaining placeholder forecast/decision-variable fields)."""
+        row = household_day.step_scenario(
+            self.assets, self._step_seconds, grid_connected=self.grid_connected
+        )
 
         row["pv_power_forecast_w"] = persistence_forecast(
             self._last_row, "pv_power_w", row["pv_power_w"]
@@ -92,7 +95,6 @@ class SimulationEngine:
         )
         row["battery_soc_headroom"] = 1.0 - row["battery_soc"]
         row["charge_rule_output_w"] = row["battery_power_w"]
-        row["grid_connected"] = float(self.grid_connected)
 
         projected_import_price, projected_export_price = self.assets.grid.peek_price(
             self.assets.clock.now + self.assets.clock.step

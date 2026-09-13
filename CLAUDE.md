@@ -11,10 +11,10 @@ a single microgrid to utility-wide orchestration of many microgrids, unifies rea
 hardware control and simulation behind one control interface, and assumes
 multi-tenant ownership with intermittent connectivity between tiers.
 
-Current status: Phase 1 implementation, M4 (extended simulated environment &
-dashboard, with replay) complete; following the phased roadmap in
-`docs/architecture.md` §6 and `docs/phase-1-dev-plan.md`, starting with a
-single-site controller + simulation.
+Current status: Phase 1 implementation, M5 (protection & control state
+machine) complete; following the phased roadmap in `docs/architecture.md` §6
+and `docs/phase-1-dev-plan.md`, starting with a single-site controller +
+simulation.
 
 ## Working conventions (always follow these)
 
@@ -95,6 +95,34 @@ single-site controller + simulation.
     without side effects). `profiles.py` gained
     `household_water_draw_profile()` and `time_of_use_tariff_profile()`
     alongside the M2 profiles.
+  - `water_heater.py` also gained `set_shed(bool)` (M5): forces the heating
+    element off regardless of hysteresis. It has no `PowerControllable`
+    setpoint to override like the other loads, so M5's protection layer
+    sheds it this way instead — the tank still depletes from draws either
+    way, only reheating is disabled.
+- `src/microgridmanager/protection/state_machine.py` — **the M5 protection &
+  control state machine**: `ProtectionState` (`NORMAL` ↔
+  `ISLANDING_TRANSITION` ↔ `ISLANDED` ↔ `BLACK_START` ↔ `RESTORATION`,
+  `ISLANDING_TRANSITION`/`RESTORATION` are one-tick transitional states so
+  the transition itself is visible rather than instantaneous),
+  `SheddableLoad` (name/priority/demand_w — priority 0 is most critical,
+  served first, shed last), and `ProtectionController.decide(grid_connected,
+  available_power_w, loads) -> ProtectionDecision` (state +
+  `served: dict[name, bool]` + `grid_exchange_allowed()`). Deliberately takes
+  plain inputs and does no I/O — deterministic and independent of any network
+  link, per the architecture doc's safety invariant and this file's
+  Working-conventions rule 5. `BLACK_START` requires exceeding critical
+  demand by `black_start_recovery_margin` (default 10%) to recover to
+  `ISLANDED`, not just barely clearing it — without that hysteresis (the same
+  pattern `SimulatedWaterHeaterAdapter` uses), a slowly-rising supply
+  hovering near the threshold for several ticks (e.g. PV ramping up at dawn)
+  flaps between states every tick it crosses back and forth. `PROTECTION_STATE_CODES`
+  maps each state to an int, since telemetry/chart series are numeric —
+  `simulation/dashboard_runner`'s `static/app.js` decodes it back to a label
+  client-side (`PROTECTION_STATE_LABELS`, kept in sync by hand).
+  `tests/unit/protection/test_state_machine.py` covers every transition's
+  guard condition and the priority-ordered shedding logic directly, with no
+  scenario/adapter involved.
 - `simulation/` — not part of the installed package; run via
   `python -m simulation.runner` (needs `pythonpath = ["."]` in
   `pyproject.toml`'s pytest config, already set, for tests to import it too).
@@ -111,9 +139,10 @@ single-site controller + simulation.
     battery is sent to `grid.set_net_power_w()`. The EV charger and water
     heater manage their own charge/reheat decisions internally (see their
     adapters above); this scenario just steps them and reads status.
-    `step_scenario()` returns one flat dict per tick (18 fields — every
-    device's power/status plus tariff price) that both `runner.py` (batch)
-    and `live_engine.py` (live) feed into the telemetry store unchanged.
+    `step_scenario()` returns one flat dict per tick (every device's
+    power/status plus tariff price and, since M5, protection fields) that
+    both `runner.py` (batch) and `live_engine.py` (live) feed into the
+    telemetry store unchanged.
     `_daily_ev_sessions(start)` generates a **recurring daily commute
     pattern** (plug in every evening, charge overnight, unplug for the
     morning commute) for a year out, rather than the original one-off list
@@ -124,9 +153,43 @@ single-site controller + simulation.
     adapter's `commute_energy_wh` (see above) so the car actually needs each
     night's charge rather than arriving already at target. See
     `tests/scenarios/test_household_day.py::test_ev_charger_keeps_plugging_in_on_later_days`.
+    - **M5**: wires the `protection/` module (above) to this scenario's
+      three controllable loads — household load priority 0 (critical, shed
+      last), water heater priority 1, EV charger priority 2 (most
+      deferrable, shed first). Every tick, `step_scenario` first clears
+      `household_load`'s override *before* reading its demand (a stale
+      override from a previous shed would otherwise read back as zero
+      demand, which — since household load is the only critical-priority
+      load — silently zeroed `critical_demand_w` and made the state machine
+      flap between `ISLANDED` and `BLACK_START` forever instead of ever
+      recovering for real; read the comment above that line before changing
+      this ordering), computes `available_power_w` as PV plus the battery's
+      energy-limited (not just rated-power-limited — the same chattering
+      trap) dischargeable power, gets a `ProtectionDecision`, and *then*
+      applies it (zero override for unserved `PowerControllable` loads,
+      `set_shed()` for the water heater) *before* stepping anything — that
+      ordering is what makes this the "final gate" the architecture doc
+      requires, not just a status readout. While
+      `decision.grid_exchange_allowed()` is false, `grid.set_net_power_w(0.0)`
+      is forced regardless of any residual imbalance — the PCC is physically
+      open. `grid_outage_between(start, end)` builds a `grid_connected_at`
+      callable for `run()` to script an outage (`runner.py`'s
+      `--outage-start-hour`/`--outage-duration-hours` flags, household_day
+      only, do this from the CLI). New row fields:
+      `household_load_served`/`ev_charger_served`/`water_heater_served`
+      (1.0/0.0) and `protection_state` (see `PROTECTION_STATE_CODES`). See
+      `tests/scenarios/test_household_day.py::test_outage_triggers_islanding_black_start_and_restoration`
+      (the M5 exit-criteria test — a scripted outage timed to end *before*
+      the marginal dawn PV-vs-demand crossing, so black-start recovery is
+      driven cleanly by the grid returning rather than a borderline
+      crossing, produces exactly `NORMAL → ISLANDING_TRANSITION → ISLANDED →
+      BLACK_START → RESTORATION → NORMAL`, zero grid power throughout, and
+      every load shed at some point and restored by the end).
   - `runner.py` — CLI: `--scenario` (`normal_day` or `household_day`),
     `--step-seconds`, `--duration-hours`, `--output`, `--telemetry-db`,
-    `--run-id`; writes the scenario's per-step readings to CSV
+    `--run-id`, and (household_day only, M5) `--outage-start-hour`/
+    `--outage-duration-hours` to script a grid outage via
+    `grid_outage_between`; writes the scenario's per-step readings to CSV
     (`output/<scenario>.csv` by default; `output/` is gitignored) **and**
     records every non-timestamp field of every row into the M3
     `TelemetryStore` under an auto-generated (or `--run-id`-supplied) run id
@@ -135,21 +198,24 @@ single-site controller + simulation.
     scenario/adapter code itself stays telemetry-agnostic.
   - `live_engine.py` — **M4's `SimulationEngine`**: drives `household_day`
     one `tick()` at a time (rather than a fixed batch loop) so the dashboard
-    can show it running live. Adds the M4 dashboard's placeholder
-    forecast/decision-variable fields to each tick's row
-    (`pv_power_forecast_w`/`household_load_power_forecast_w` — persistence,
-    i.e. last tick's actual, from `microgridmanager.dashboard.placeholders`;
-    `battery_soc_headroom`; `charge_rule_output_w`; `grid_connected`;
-    `grid_projected_import/export_price_per_kwh` via `grid.peek_price()`)
-    before recording to telemetry and appending to a rolling in-memory
-    `history` deque the live charts read from. Exposes `start()`/`pause()`/
-    `reset()`/`set_speed()`/`set_grid_connected()` for the controls panel.
-    Deliberately lives under `simulation/` (not the installed package) since
-    it wires up one specific scenario, mirroring `runner.py`'s role for batch
-    runs — see its module docstring for the small duck-typed interface
-    `microgridmanager.dashboard.app` depends on instead of importing this
-    directly, so the installed dashboard package stays scenario-agnostic
-    (M9 can point it at a real site controller without changing it).
+    can show it running live. Passes its `grid_connected` (the dashboard's
+    manual toggle) straight into `step_scenario` (M5: this is now the real
+    input to the protection state machine, not a placeholder) and adds the
+    dashboard's remaining placeholder forecast/decision-variable fields to
+    each tick's row (`pv_power_forecast_w`/`household_load_power_forecast_w`
+    — persistence, i.e. last tick's actual, from
+    `microgridmanager.dashboard.placeholders`; `battery_soc_headroom`;
+    `charge_rule_output_w`; `grid_projected_import/export_price_per_kwh` via
+    `grid.peek_price()`) before recording to telemetry and appending to a
+    rolling in-memory `history` deque the live charts read from. Exposes
+    `start()`/`pause()`/`reset()`/`set_speed()`/`set_grid_connected()` for
+    the controls panel. Deliberately lives under `simulation/` (not the
+    installed package) since it wires up one specific scenario, mirroring
+    `runner.py`'s role for batch runs — see its module docstring for the
+    small duck-typed interface `microgridmanager.dashboard.app` depends on
+    instead of importing this directly, so the installed dashboard package
+    stays scenario-agnostic (M9 can point it at a real site controller
+    without changing it).
   - `dashboard_runner.py` — CLI (`python -m simulation.dashboard_runner`,
     `make run-dashboard`) wiring a `TelemetryStore` + `SimulationEngine` into
     `microgridmanager.dashboard.app.create_app()` and serving it with
@@ -184,17 +250,22 @@ single-site controller + simulation.
   speed/grid_connected/run_id/latest reading), `GET /api/history?limit=`
   (recent rows for live charts), `POST /api/controls/{start,pause,reset}`,
   `POST /api/controls/speed` `{speed}`, `POST /api/controls/grid`
-  `{connected}` (the manual grid connect/disconnect toggle — no physical
-  effect yet, it only drives the placeholder island indicator; M5 wires it to
-  the real protection state machine), `GET /api/runs` /
-  `GET /api/runs/{run_id}/series` (thin wrappers over `TelemetryStore`), and
-  `GET /api/runs/{run_id}/data` (every series for a run, bundled for
+  `{connected}` (the manual grid connect/disconnect toggle — since M5, real
+  input to the protection state machine, not a placeholder), `GET /api/runs`
+  / `GET /api/runs/{run_id}/series` (thin wrappers over `TelemetryStore`),
+  and `GET /api/runs/{run_id}/data` (every series for a run, bundled for
   replay). `placeholders.py` holds `persistence_forecast()` — the inline
   stand-in for M6's real forecasting model; M6/M7 replace the *callers* of
   these functions without changing the dashboard panels, since the series
   names stay the same (the tracked placeholder-to-real swaps from the Phase 1
-  plan). `static/app.js` polls `/api/state` + `/api/history` every second in
-  Live mode; Replay mode lists `/api/runs`, loads one run's
+  plan). `static/app.js` decodes the numeric `protection_state` field back to
+  a label (`PROTECTION_STATE_LABELS`, mirrors
+  `microgridmanager.protection.state_machine.PROTECTION_STATE_CODES` by
+  hand — update both if the states ever change) for the "Protection state
+  machine" decision card and the `chart-protection` chart (state plus each
+  load's served/shed flag over time — M5's dashboard-visible result). Polls
+  `/api/state` + `/api/history` every second in Live mode; Replay mode lists
+  `/api/runs`, loads one run's
   `/api/runs/{id}/data`, reconstructs per-tick rows by indexing every
   series array position-for-position (`reconstructRows`), and scrubs through
   them client-side (play/pause/seek/speed) reusing the same card/chart
@@ -221,8 +292,15 @@ single-site controller + simulation.
   - `tests/unit/adapters/simulated/` — physics unit tests per M2/M4 adapter
     (SoC bounds/efficiency, PV tracking irradiance, generator fuel curve and
     rated-power clamping, clock advancement, EV session plug/unplug and
-    target-SoC charging, water heater hysteresis and tank bounds, grid
-    cumulative import/export energy and tariff timing).
+    target-SoC charging, water heater hysteresis and tank bounds — including
+    M5's `set_shed()` forcing the element off and releasing back to normal
+    hysteresis — grid cumulative import/export energy and tariff timing).
+  - `tests/unit/protection/test_state_machine.py` — **M5's** direct unit
+    tests for `ProtectionController`: every transition's guard condition
+    (including same-tick grid recovery during `ISLANDING_TRANSITION`, the
+    `black_start_recovery_margin` hysteresis, and the empty-loads edge case)
+    and the priority-ordered shedding logic, with no scenario/adapter
+    involved.
   - `tests/scenarios/test_normal_day.py` — the M2 exit-criteria test: a full
     simulated day runs without errors and produces plausible output (SoC
     stays in bounds, generator only fires on a genuine shortfall, fuel use is
@@ -233,7 +311,8 @@ single-site controller + simulation.
     EV only draws power while plugged in, grid cumulative energy is
     monotonic, the tariff actually switches peak/off-peak, and the grid's
     reported power always equals the residual of every other device's
-    balance).
+    balance) — plus the M5 outage/black-start/restoration exit-criteria test
+    (see the `household_day.py` entry above).
   - `tests/unit/dashboard/` — `test_app.py` drives the FastAPI app's API
     (state/history/controls/runs/series) via `TestClient`, ticking the engine
     manually rather than relying on the real-time background loop so tests
@@ -248,7 +327,8 @@ single-site controller + simulation.
   the telemetry store use only the standard library, `csv` and `sqlite3`).
   M4 adds `fastapi` and `uvicorn[standard]` as runtime dependencies (per the
   Phase 1 tech stack table) and `httpx` to the `dev` group (required by
-  FastAPI's `TestClient`).
+  FastAPI's `TestClient`). M5 adds none (the state machine is pure Python
+  logic, no I/O).
 - `Makefile` — `make test` (pytest), `make lint` (ruff), `make run-scenario`
   (runs the M2 normal-day scenario by default; pass `ARGS="--scenario
   household_day"` for M4's six-device scenario), `make query-telemetry
