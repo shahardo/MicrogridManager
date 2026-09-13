@@ -11,10 +11,9 @@ a single microgrid to utility-wide orchestration of many microgrids, unifies rea
 hardware control and simulation behind one control interface, and assumes
 multi-tenant ownership with intermittent connectivity between tiers.
 
-Current status: Phase 1 implementation, M5 (protection & control state
-machine) complete; following the phased roadmap in `docs/architecture.md` §6
-and `docs/phase-1-dev-plan.md`, starting with a single-site controller +
-simulation.
+Current status: Phase 1 implementation, M6 (forecasting) complete; following
+the phased roadmap in `docs/architecture.md` §6 and `docs/phase-1-dev-plan.md`,
+starting with a single-site controller + simulation.
 
 ## Working conventions (always follow these)
 
@@ -123,6 +122,51 @@ simulation.
   `tests/unit/protection/test_state_machine.py` covers every transition's
   guard condition and the priority-ordered shedding logic directly, with no
   scenario/adapter involved.
+- `src/microgridmanager/forecasting/` — **M6's forecasting module**: the
+  seam between historical series and a point forecast, the same shape as
+  M1's `AssetAdapter` seam (`docs/phase-1-dev-plan.md`'s exit criteria: "M7
+  can consume forecasts without knowing which model produced them").
+  - `interface.py` — `HistoricalPoint` (timestamp/value) and the abstract
+    `Forecaster.predict(history, target_time, *, fallback=0.0) -> float`.
+    Implementations must ignore any `history` point at or after
+    `target_time` — using it would be forecasting a value from itself —
+    rather than relying on callers to pre-filter their own buffers.
+  - `baseline.py` — two implementations: `PersistenceForecaster` (predicts
+    `target_time` as whatever was most recently observed before it — this is
+    the M4 dashboard's original inline forecast, now behind the real
+    interface) and `SeasonalAverageForecaster` (the dev plan's "same-day-
+    last-week average" option, generalized via `period`/`max_lookback_cycles`
+    — `period=24h` predicts "same time of day, averaged over the last N
+    days"; `period=7d` predicts "same day, averaged over the last N weeks").
+    `SeasonalAverageForecaster` falls back to a plain persistence forecast
+    while no cycle-old sample exists yet (e.g. a live session's first day),
+    so early predictions degrade gracefully instead of returning `fallback`
+    for a whole cycle.
+  - `accuracy.py` — `mean_absolute_error()`/`mean_absolute_percentage_error()`
+    over paired actual/forecast sequences (MAPE skips points where `actual`
+    is exactly zero, e.g. PV power overnight, rather than dividing by zero).
+  - `tests/unit/forecasting/` — `contracts.py` (`assert_forecast_contract`,
+    mirroring the adapter suite's pattern: empty history returns `fallback`,
+    predictions are deterministic, a constant history is predicted exactly,
+    and points at/after `target_time` are ignored) and
+    `test_contract_suite.py` parametrized over both baseline models — future
+    ML-based models should extend this parametrization rather than get their
+    own separate checks. `test_baseline.py` covers each model's specific
+    behavior (persistence's most-recent-observation semantics; seasonal
+    averaging's first-cycle fallback, same-time-of-day matching, and
+    lookback-cycle limit). `test_accuracy.py` covers the metrics' known
+    values plus the dev plan's "forecast accuracy within a defined bound on
+    synthetic data with known patterns" exit criterion: on a synthetic
+    repeating daily step pattern, `SeasonalAverageForecaster` stays under a
+    fixed MAE bound and clearly beats `PersistenceForecaster` (whose error is
+    concentrated at each day's step transitions).
+  - `simulation/live_engine.py`'s `SimulationEngine` uses
+    `SeasonalAverageForecaster` (period=24h) for the dashboard's live
+    `pv_power_forecast_w`/`household_load_power_forecast_w` fields (see the
+    `simulation/` entry below), and `simulation/forecast_report.py` is this
+    milestone's CLI visible result — both replace the *callers* of the old
+    placeholder without changing the dashboard's forecast panel, since the
+    series names stay the same.
 - `simulation/` — not part of the installed package; run via
   `python -m simulation.runner` (needs `pythonpath = ["."]` in
   `pyproject.toml`'s pytest config, already set, for tests to import it too).
@@ -201,13 +245,20 @@ simulation.
     can show it running live. Passes its `grid_connected` (the dashboard's
     manual toggle) straight into `step_scenario` (M5: this is now the real
     input to the protection state machine, not a placeholder) and adds the
-    dashboard's remaining placeholder forecast/decision-variable fields to
-    each tick's row (`pv_power_forecast_w`/`household_load_power_forecast_w`
-    — persistence, i.e. last tick's actual, from
-    `microgridmanager.dashboard.placeholders`; `battery_soc_headroom`;
-    `charge_rule_output_w`; `grid_projected_import/export_price_per_kwh` via
-    `grid.peek_price()`) before recording to telemetry and appending to a
-    rolling in-memory `history` deque the live charts read from. Exposes
+    dashboard's remaining forecast/decision-variable fields to each tick's
+    row: `pv_power_forecast_w`/`household_load_power_forecast_w` (since M6,
+    a real `microgridmanager.forecasting.SeasonalAverageForecaster` per
+    series — see below — replacing the M4 dashboard's inline
+    `persistence_forecast` placeholder; `battery_soc_headroom` and
+    `charge_rule_output_w` remain M7 dispatch placeholders) and
+    `grid_projected_import/export_price_per_kwh` via `grid.peek_price()`)
+    before recording to telemetry and appending to a rolling in-memory
+    `history` deque the live charts read from. Maintains a small per-series
+    `deque[HistoricalPoint]` (bounded to the forecaster's lookback window
+    plus one cycle of margin) for `pv_power_w`/`household_load_power_w`,
+    feeding each tick's forecast from history recorded strictly *before*
+    that tick, then appending the actual observation afterwards — a
+    forecaster must never see the value it's predicting. Exposes
     `start()`/`pause()`/`reset()`/`set_speed()`/`set_grid_connected()` for
     the controls panel. Deliberately lives under `simulation/` (not the
     installed package) since it wires up one specific scenario, mirroring
@@ -220,6 +271,17 @@ simulation.
     `make run-dashboard`) wiring a `TelemetryStore` + `SimulationEngine` into
     `microgridmanager.dashboard.app.create_app()` and serving it with
     `uvicorn`. Flags: `--host`, `--port`, `--telemetry-db`, `--step-seconds`.
+  - `forecast_report.py` — **M6's visible result**: CLI (`python -m
+    simulation.forecast_report`, `make forecast-report`) that runs a
+    scenario, replays both baseline `Forecaster`s (`PersistenceForecaster`,
+    `SeasonalAverageForecaster`) online against its PV/load series exactly
+    like `live_engine.tick()` does, and prints each model's MAE/MAPE — e.g.
+    `make forecast-report ARGS="--scenario household_day --duration-hours
+    72"` shows `SeasonalAverageForecaster` roughly a third of
+    `PersistenceForecaster`'s error on both series once a full day of
+    history exists. Flags: `--scenario` (`normal_day`/`household_day`),
+    `--step-seconds`, `--duration-hours` (defaults to 72h so the seasonal
+    model's daily-average behavior actually kicks in after the first day).
 - `src/microgridmanager/telemetry/store.py` — **the M3 append-only telemetry
   store** (`TelemetryStore`, `TelemetrySample`). SQLite-backed, long/narrow
   schema (`run_id`, `timestamp`, `asset_id` (nullable), `series`, `value`) —
@@ -254,11 +316,15 @@ simulation.
   input to the protection state machine, not a placeholder), `GET /api/runs`
   / `GET /api/runs/{run_id}/series` (thin wrappers over `TelemetryStore`),
   and `GET /api/runs/{run_id}/data` (every series for a run, bundled for
-  replay). `placeholders.py` holds `persistence_forecast()` — the inline
-  stand-in for M6's real forecasting model; M6/M7 replace the *callers* of
-  these functions without changing the dashboard panels, since the series
-  names stay the same (the tracked placeholder-to-real swaps from the Phase 1
-  plan). `static/app.js` decodes the numeric `protection_state` field back to
+  replay). The M4 dashboard's `placeholders.py` (which held the inline
+  `persistence_forecast()` stand-in) is gone as of M6 — `live_engine.py` now
+  computes the forecast panel's fields from the real
+  `microgridmanager.forecasting` module instead, with no change to this
+  module or its panels, per the Phase 1 plan's tracked placeholder-to-real
+  swaps (M7's dispatch placeholders — `battery_soc_headroom`,
+  `charge_rule_output_w` — are still inline in `live_engine.py`, not in a
+  separate placeholders module, and remain until M7). `static/app.js`
+  decodes the numeric `protection_state` field back to
   a label (`PROTECTION_STATE_LABELS`, mirrors
   `microgridmanager.protection.state_machine.PROTECTION_STATE_CODES` by
   hand — update both if the states ever change) for the "Protection state
@@ -328,11 +394,14 @@ simulation.
   M4 adds `fastapi` and `uvicorn[standard]` as runtime dependencies (per the
   Phase 1 tech stack table) and `httpx` to the `dev` group (required by
   FastAPI's `TestClient`). M5 adds none (the state machine is pure Python
-  logic, no I/O).
+  logic, no I/O). M6 adds none either (the forecasting module is pure Python
+  logic over plain in-memory sequences, no I/O).
 - `Makefile` — `make test` (pytest), `make lint` (ruff), `make run-scenario`
   (runs the M2 normal-day scenario by default; pass `ARGS="--scenario
   household_day"` for M4's six-device scenario), `make query-telemetry
   ARGS="..."` (M3's CLI), `make run-dashboard` (M4's dashboard — starts a
-  uvicorn server at `http://127.0.0.1:8000`). Native Windows PowerShell
-  usually does not ship with `make`, so Windows users should run the
-  equivalent `uv run ...` commands directly instead of `make`.
+  uvicorn server at `http://127.0.0.1:8000`), `make forecast-report
+  ARGS="..."` (M6's CLI — see `simulation/forecast_report.py` above). Native
+  Windows PowerShell usually does not ship with `make`, so Windows users
+  should run the equivalent `uv run ...` commands directly instead of
+  `make`.

@@ -33,20 +33,22 @@ implementation roadmap.
 
 ## Status
 
-**Implementation in progress (Phase 1, M5 — protection & control state
-machine).** The architecture and Phase 1 plan are defined (see
-`docs/architecture.md` §6 and `docs/phase-1-dev-plan.md`). M1 delivered the
-canonical asset model and `AssetAdapter` interface; M2 added simulated PV,
-battery (BESS), controllable load, and diesel/gas generator adapters plus a
-shared discrete-time simulation clock, and a scripted "normal day" scenario
-that exercises them end-to-end; M3 added a durable, queryable telemetry
-store; M4 added an EV charger, a water heater, and a grid connection (with a
-time-of-use tariff) as three more simulated devices, a six-device "household
-day" scenario combining all of them, and a live/replay web dashboard; M5
-adds the safety-critical protection state machine — islanding detection,
-black start, and priority-ordered load shedding — in front of it all, driven
-either by the dashboard's grid connect/disconnect toggle or a scripted
-outage.
+**Implementation in progress (Phase 1, M6 — forecasting).** The architecture
+and Phase 1 plan are defined (see `docs/architecture.md` §6 and
+`docs/phase-1-dev-plan.md`). M1 delivered the canonical asset model and
+`AssetAdapter` interface; M2 added simulated PV, battery (BESS), controllable
+load, and diesel/gas generator adapters plus a shared discrete-time
+simulation clock, and a scripted "normal day" scenario that exercises them
+end-to-end; M3 added a durable, queryable telemetry store; M4 added an EV
+charger, a water heater, and a grid connection (with a time-of-use tariff) as
+three more simulated devices, a six-device "household day" scenario combining
+all of them, and a live/replay web dashboard; M5 added the safety-critical
+protection state machine — islanding detection, black start, and
+priority-ordered load shedding — in front of it all, driven either by the
+dashboard's grid connect/disconnect toggle or a scripted outage; M6 adds a
+real forecasting module (a `Forecaster` interface plus persistence and
+same-time-of-day-average baseline models) that now drives the dashboard's
+forecast panel, replacing its original inline placeholder.
 
 ## Development setup
 
@@ -170,14 +172,44 @@ e.g. `uv run python scripts/query_telemetry.py --run-id <run> --series pv_power_
   `make run-scenario` or a previous live session) and lets you play/pause/
   seek/speed through it using the same device cards and charts.
 
-The forecast panel and the "decision variables" panel's battery/tariff cards
-(current/projected tariff price, battery SoC headroom, the self-consumption
-rule's output) ship with small inline placeholders standing in for the real
-forecasting (M6) and dispatch (M7) engines, which don't exist yet — those
-milestones swap in real data without changing the panels. The protection
-state card next to them is real, not a placeholder, as of M5.
+The forecast panel is now backed by the real M6 forecasting module (see
+"Forecasting" below) — no more placeholder. The "decision variables" panel's
+battery/tariff cards (battery SoC headroom, the self-consumption rule's
+output) still ship with small inline placeholders standing in for the real
+dispatch (M7) engine, which doesn't exist yet — that milestone swaps in real
+data without changing the panel. The protection state card next to them is
+real, not a placeholder, as of M5.
 
 Options: `--host`, `--port`, `--telemetry-db`, `--step-seconds`.
+
+## Forecasting
+
+`microgridmanager.forecasting` (M6) defines a `Forecaster` interface —
+`predict(history, target_time, fallback=...) -> float` — and two baseline
+implementations:
+
+- **`PersistenceForecaster`** — predicts a series' next value as whatever was
+  most recently observed (the M4 dashboard's original inline forecast, now
+  behind the real interface).
+- **`SeasonalAverageForecaster`** — predicts a series' value as the average
+  of the value observed at the same point in each of the last few cycles of
+  a configurable `period` (24h by default: "same time of day, averaged over
+  the last week"). Falls back to a persistence-style forecast during the
+  first cycle, before any seasonal history exists yet.
+
+The dashboard's live engine (`simulation/live_engine.py`) uses
+`SeasonalAverageForecaster` for the PV/household-load forecast panel and
+chart — the same fields the M4 placeholder used to fill in, so no dashboard
+changes were needed.
+
+`make forecast-report ARGS="--scenario household_day --duration-hours 72"`
+(or, on Windows, `uv run python -m simulation.forecast_report --scenario
+household_day --duration-hours 72`) runs a scenario and prints each model's
+MAE/MAPE against the actual PV and household-load series — this is M6's
+visible result, and typically shows `SeasonalAverageForecaster` cutting the
+error roughly by a third to a half versus plain persistence once a full
+day's history has accumulated. Options: `--scenario`
+(`normal_day`/`household_day`), `--step-seconds`, `--duration-hours`.
 
 ## Development conventions
 
