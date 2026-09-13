@@ -43,10 +43,23 @@ single-site controller + simulation.
 - `docs/phase-1-dev-plan.md` — the detailed, milestone-by-milestone Phase 1 plan.
 - `src/microgridmanager/` — the installable package (`assets/`, `adapters/`
   with `simulated/`/`real/` splits, `protection/`, `forecasting/`,
-  `dispatch/`, `telemetry/`, `dashboard/`) — currently empty package
-  skeletons, filled in milestone by milestone per the Phase 1 plan.
+  `dispatch/`, `telemetry/`, `dashboard/`) — filled in milestone by milestone
+  per the Phase 1 plan.
+  - `adapters/interface.py` — **the canonical asset model and `AssetAdapter`
+    interface** (M1). The base `AssetAdapter` ABC (`asset_id`, `asset_type`,
+    `get_state()`) plus capability mixins (`PowerControllable`,
+    `StateOfChargeReadable`, `Switchable`, `MeterReadable`) that concrete
+    adapters compose as needed. This is the seam every future adapter (M2
+    simulated, M4 EV charger/water heater, M8 real Modbus/SunSpec) must
+    implement without changing it.
 - `tests/` — `unit/`, `integration/`, `scenarios/` (added as milestones need
   them).
+  - `tests/unit/adapters/` — the **adapter contract test suite**: `fakes.py`
+    (minimal in-memory test-double adapters), `contracts.py` (reusable
+    `assert_*_contract` functions, one per capability), and
+    `test_contract_suite.py` (parametrized checks). New adapter
+    implementations should be added to this suite's parametrization rather
+    than given their own separate contract tests.
 - `pyproject.toml` — project config; dependencies managed with `uv`
   (`uv sync --group dev` creates `.venv` and installs everything — never
   install packages globally).

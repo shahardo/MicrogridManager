@@ -33,7 +33,8 @@ implementation roadmap.
 
 ## Status
 
-**Implementation started (Phase 1, M0 — project scaffolding).** The
+**Implementation started (Phase 1, M1 — canonical asset model & adapter
+interface).** The
 architecture and Phase 1 plan are defined (see `docs/architecture.md` §6 and
 `docs/phase-1-dev-plan.md`); a single-site controller running against
 simulated hardware is being built first.
