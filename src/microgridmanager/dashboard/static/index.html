@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MicrogridManager Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>MicrogridManager <span class="subtitle">household site</span></h1>
+    <nav class="mode-switch">
+      <button id="mode-live" class="mode-btn active" data-mode="live">Live</button>
+      <button id="mode-replay" class="mode-btn" data-mode="replay">Replay</button>
+    </nav>
+  </header>
+
+  <section id="controls-panel" class="panel">
+    <h2>Controls</h2>
+    <div id="live-controls" class="controls-row">
+      <button id="btn-start">Start</button>
+      <button id="btn-pause">Pause</button>
+      <button id="btn-reset">Reset</button>
+      <label>Speed
+        <input id="speed-input" type="number" min="0.1" step="0.1" value="1.0" />
+      </label>
+      <label class="toggle">
+        <input id="grid-toggle" type="checkbox" checked />
+        Grid connected
+      </label>
+      <span id="run-id-label" class="run-id"></span>
+    </div>
+    <div id="replay-controls" class="controls-row hidden">
+      <label>Run
+        <select id="replay-run-select"></select>
+      </label>
+      <button id="replay-play">Play</button>
+      <button id="replay-pause">Pause</button>
+      <input id="replay-seek" type="range" min="0" max="0" value="0" />
+      <span id="replay-position"></span>
+      <label>Speed
+        <input id="replay-speed" type="number" min="0.1" step="0.1" value="1.0" />
+      </label>
+    </div>
+  </section>
+
+  <section id="device-panel" class="panel">
+    <h2>Devices</h2>
+    <div class="device-cards" id="device-cards"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Decision variables</h2>
+    <div class="device-cards" id="decision-cards"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Power (W)</h2>
+    <canvas id="chart-power" width="900" height="260"></canvas>
+  </section>
+
+  <section class="panel">
+    <h2>Storage levels (0-1)</h2>
+    <canvas id="chart-levels" width="900" height="220"></canvas>
+  </section>
+
+  <section class="panel">
+    <h2>Grid tariff ($/kWh)</h2>
+    <canvas id="chart-price" width="900" height="220"></canvas>
+  </section>
+
+  <section class="panel">
+    <h2>Forecast vs actual (placeholder persistence model, M6 replaces this)</h2>
+    <canvas id="chart-forecast" width="900" height="220"></canvas>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

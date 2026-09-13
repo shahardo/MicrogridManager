@@ -15,6 +15,8 @@ from typing import Callable
 IrradianceProfile = Callable[[datetime], float]
 LoadProfile = Callable[[datetime], float]
 FuelCurve = Callable[[float, float], float]  # (active_power_w, rated_power_w) -> liters/hour
+WaterDrawProfile = Callable[[datetime], float]  # -> thermal energy draw rate, in watts
+TariffProfile = Callable[[datetime], tuple[float, float]]  # -> (import, export) price per kWh
 
 
 def _hour_of_day(at: datetime) -> float:
@@ -64,6 +66,50 @@ def daily_load_profile(
             -((hour - evening_hour) ** 2) / (2 * peak_width_hours**2)
         )
         return base_watts + morning + evening
+
+    return profile
+
+
+def household_water_draw_profile(
+    base_watts: float = 50.0,
+    morning_draw_watts: float = 3_000.0,
+    evening_draw_watts: float = 4_000.0,
+    morning_hour: float = 7.0,
+    evening_hour: float = 20.0,
+    draw_width_hours: float = 0.75,
+) -> WaterDrawProfile:
+    """A small idle heat-loss draw plus two gaussian bumps (morning/evening
+    showers) — enough to force the tank to deplete and reheat like a real
+    household water heater, without a physical thermal model."""
+
+    def profile(at: datetime) -> float:
+        hour = _hour_of_day(at)
+        morning = morning_draw_watts * math.exp(
+            -((hour - morning_hour) ** 2) / (2 * draw_width_hours**2)
+        )
+        evening = evening_draw_watts * math.exp(
+            -((hour - evening_hour) ** 2) / (2 * draw_width_hours**2)
+        )
+        return base_watts + morning + evening
+
+    return profile
+
+
+def time_of_use_tariff_profile(
+    off_peak_import: float = 0.12,
+    peak_import: float = 0.35,
+    off_peak_export: float = 0.05,
+    peak_export: float = 0.10,
+    peak_start_hour: float = 16.0,
+    peak_end_hour: float = 21.0,
+) -> TariffProfile:
+    """A simple two-tier time-of-use tariff: a peak price window (e.g. evening
+    demand peak) and an off-peak price otherwise, for both import and export."""
+
+    def profile(at: datetime) -> tuple[float, float]:
+        hour = _hour_of_day(at)
+        is_peak = peak_start_hour <= hour < peak_end_hour
+        return (peak_import, peak_export) if is_peak else (off_peak_import, off_peak_export)
 
     return profile
 

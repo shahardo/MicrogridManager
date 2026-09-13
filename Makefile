@@ -7,10 +7,10 @@ lint:
 	uv run ruff check .
 
 run-dashboard:
-	@echo "Not implemented yet — see docs/phase-1-dev-plan.md (M4/M9)"
+	uv run python -m simulation.dashboard_runner $(ARGS)
 
 run-scenario:
-	uv run python -m simulation.runner
+	uv run python -m simulation.runner $(ARGS)
 
 query-telemetry:
 	uv run python scripts/query_telemetry.py $(ARGS)

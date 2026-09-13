@@ -11,6 +11,7 @@ survives a process restart with no extra wiring.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -49,15 +50,20 @@ class TelemetryStore:
     """A SQLite-backed, append-only telemetry log.
 
     Safe to reopen against the same file across process restarts: all state
-    lives on disk, nothing is cached only in memory.
+    lives on disk, nothing is cached only in memory. Also safe to share
+    across threads (e.g. the M4 dashboard's background simulation loop
+    writing while a request-handling thread reads): the underlying
+    connection is guarded by a lock rather than confined to one thread.
     """
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path)
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        with self._lock:
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
 
     def record(self, sample: TelemetrySample) -> None:
         self.record_many([sample])
@@ -68,12 +74,13 @@ class TelemetryStore:
         ]
         if not rows:
             return
-        self._conn.executemany(
-            "INSERT INTO telemetry_samples (run_id, timestamp, asset_id, series, value) "
-            "VALUES (?, ?, ?, ?, ?)",
-            rows,
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO telemetry_samples (run_id, timestamp, asset_id, series, value) "
+                "VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
 
     def query(
         self,
@@ -100,7 +107,8 @@ class TelemetryStore:
             "SELECT run_id, timestamp, asset_id, series, value FROM telemetry_samples "
             f"WHERE {' AND '.join(clauses)} ORDER BY timestamp ASC"
         )
-        rows = self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
         return [
             TelemetrySample(
                 run_id=row[0],
@@ -113,20 +121,23 @@ class TelemetryStore:
         ]
 
     def list_runs(self) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT DISTINCT run_id FROM telemetry_samples ORDER BY run_id"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT run_id FROM telemetry_samples ORDER BY run_id"
+            ).fetchall()
         return [row[0] for row in rows]
 
     def list_series(self, run_id: str) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT DISTINCT series FROM telemetry_samples WHERE run_id = ? ORDER BY series",
-            (run_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT series FROM telemetry_samples WHERE run_id = ? ORDER BY series",
+                (run_id,),
+            ).fetchall()
         return [row[0] for row in rows]
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def __enter__(self) -> TelemetryStore:
         return self

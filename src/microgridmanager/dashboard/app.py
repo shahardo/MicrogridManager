@@ -1,0 +1,152 @@
+"""M4 dashboard: a FastAPI service exposing live device status/charts and a
+replay mode over completed telemetry runs, plus a minimal static web page.
+
+This module is deliberately scenario-agnostic: `create_app` takes an
+"engine" object (see `simulation.live_engine.SimulationEngine`'s docstring
+for the small interface it must satisfy) and a `TelemetryStore`, and never
+imports anything from `simulation/`. That keeps the installed package usable
+against a real site controller later (M9) without changing this module —
+only what's wired up in `simulation/dashboard_runner.py` (or a future
+production entry point) needs to change.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any, Protocol
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from microgridmanager.telemetry import TelemetryStore
+
+STATIC_DIR = Path(__file__).parent / "static"
+DEFAULT_TICK_INTERVAL_SECONDS = 1.0
+DEFAULT_HISTORY_LIMIT = 200
+
+
+class LiveEngine(Protocol):
+    """The subset of `SimulationEngine` this module depends on."""
+
+    running: bool
+    speed: float
+    grid_connected: bool
+    run_id: str
+    history: Any
+
+    def start(self) -> None: ...
+    def pause(self) -> None: ...
+    def reset(self) -> None: ...
+    def set_speed(self, speed: float) -> None: ...
+    def set_grid_connected(self, connected: bool) -> None: ...
+    def tick(self) -> dict: ...
+
+
+class SpeedRequest(BaseModel):
+    speed: float
+
+
+class GridConnectionRequest(BaseModel):
+    connected: bool
+
+
+async def _run_engine_loop(engine: LiveEngine, base_interval_seconds: float) -> None:
+    while True:
+        if engine.running:
+            engine.tick()
+        await asyncio.sleep(base_interval_seconds / engine.speed)
+
+
+def create_app(
+    engine: LiveEngine,
+    telemetry_store: TelemetryStore,
+    *,
+    tick_interval_seconds: float = DEFAULT_TICK_INTERVAL_SECONDS,
+) -> FastAPI:
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        loop_task = asyncio.create_task(_run_engine_loop(engine, tick_interval_seconds))
+        try:
+            yield
+        finally:
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+
+    app = FastAPI(title="MicrogridManager Dashboard", lifespan=lifespan)
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.get("/")
+    def index() -> FileResponse:
+        return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/api/state")
+    def get_state() -> dict:
+        latest = engine.history[-1] if engine.history else None
+        return {
+            "running": engine.running,
+            "speed": engine.speed,
+            "grid_connected": engine.grid_connected,
+            "run_id": engine.run_id,
+            "latest": latest,
+        }
+
+    @app.get("/api/history")
+    def get_history(limit: int = DEFAULT_HISTORY_LIMIT) -> list[dict]:
+        history = list(engine.history)
+        return history[-limit:] if limit > 0 else history
+
+    @app.post("/api/controls/start")
+    def start() -> dict:
+        engine.start()
+        return {"running": engine.running}
+
+    @app.post("/api/controls/pause")
+    def pause() -> dict:
+        engine.pause()
+        return {"running": engine.running}
+
+    @app.post("/api/controls/reset")
+    def reset() -> dict:
+        engine.reset()
+        return {"running": engine.running, "run_id": engine.run_id}
+
+    @app.post("/api/controls/speed")
+    def set_speed(request: SpeedRequest) -> dict:
+        try:
+            engine.set_speed(request.speed)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"speed": engine.speed}
+
+    @app.post("/api/controls/grid")
+    def set_grid_connected(request: GridConnectionRequest) -> dict:
+        engine.set_grid_connected(request.connected)
+        return {"grid_connected": engine.grid_connected}
+
+    @app.get("/api/runs")
+    def list_runs() -> list[str]:
+        return telemetry_store.list_runs()
+
+    @app.get("/api/runs/{run_id}/series")
+    def list_series(run_id: str) -> list[str]:
+        return telemetry_store.list_series(run_id)
+
+    @app.get("/api/runs/{run_id}/data")
+    def get_run_data(run_id: str) -> dict[str, list[dict]]:
+        series_names = telemetry_store.list_series(run_id)
+        if not series_names:
+            raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id!r}")
+        return {
+            series: [
+                {"timestamp": sample.timestamp.isoformat(), "value": sample.value}
+                for sample in telemetry_store.query(run_id=run_id, series=series)
+            ]
+            for series in series_names
+        }
+
+    return app

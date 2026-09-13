@@ -1,0 +1,78 @@
+import pytest
+
+from microgridmanager.adapters.simulated.clock import SimulationClock
+from microgridmanager.adapters.simulated.water_heater import SimulatedWaterHeaterAdapter
+
+
+def test_tank_starts_full_and_not_heating() -> None:
+    heater = SimulatedWaterHeaterAdapter("wh-1", initial_tank_fraction=1.0)
+    state = heater.get_state()
+    assert state.tank_energy_fraction == pytest.approx(1.0)
+    assert state.heating is False
+    assert state.active_power_w == 0.0
+
+
+def test_draw_depletes_tank() -> None:
+    heater = SimulatedWaterHeaterAdapter(
+        "wh-1", capacity_wh=4_000.0, draw_profile=lambda _at: 1_000.0
+    )
+    heater.step(3600.0)
+    assert heater.get_state().tank_energy_fraction < 1.0
+
+
+def test_heating_turns_on_below_low_threshold() -> None:
+    heater = SimulatedWaterHeaterAdapter(
+        "wh-1",
+        capacity_wh=1_000.0,
+        rated_power_w=1_000.0,
+        initial_tank_fraction=0.5,
+        low_fraction=0.4,
+        high_fraction=0.9,
+        draw_profile=lambda _at: 2_000.0,
+    )
+    heater.step(3600.0)  # depletes below low_fraction, so heating should kick in
+
+    state = heater.get_state()
+    assert state.heating is True
+    assert state.active_power_w == 1_000.0
+
+
+def test_heating_turns_off_at_high_threshold() -> None:
+    heater = SimulatedWaterHeaterAdapter(
+        "wh-1",
+        capacity_wh=1_000.0,
+        rated_power_w=5_000.0,
+        initial_tank_fraction=0.3,
+        low_fraction=0.4,
+        high_fraction=0.9,
+        draw_profile=lambda _at: 0.0,
+    )
+
+    for _ in range(5):
+        heater.step(600.0)
+
+    state = heater.get_state()
+    assert state.tank_energy_fraction >= 0.9
+    assert state.heating is False
+    assert state.active_power_w == 0.0
+
+
+def test_tank_energy_stays_within_bounds() -> None:
+    heater = SimulatedWaterHeaterAdapter(
+        "wh-1",
+        capacity_wh=1_000.0,
+        rated_power_w=6_000.0,
+        initial_tank_fraction=1.0,
+        draw_profile=lambda _at: 10_000.0,
+    )
+
+    for _ in range(20):
+        heater.step(3600.0)
+        assert 0.0 <= heater.get_state().tank_energy_fraction <= 1.0
+
+
+def test_timestamp_reflects_shared_clock() -> None:
+    clock = SimulationClock()
+    heater = SimulatedWaterHeaterAdapter("wh-1", clock=clock)
+    clock.tick()
+    assert heater.get_state().timestamp == clock.now

@@ -20,9 +20,12 @@ from microgridmanager.adapters.interface import (
 )
 from microgridmanager.adapters.simulated import (
     SimulatedBatteryAdapter,
+    SimulatedEVChargerAdapter,
     SimulatedGeneratorAdapter,
+    SimulatedGridConnectionAdapter,
     SimulatedLoadAdapter,
     SimulatedPVAdapter,
+    SimulatedWaterHeaterAdapter,
 )
 
 from .contracts import (
@@ -50,13 +53,17 @@ ALL_FAKE_ADAPTERS = [
     FakeMeterAdapter,
 ]
 
-# M2's simulated adapters extend this suite's parametrization rather than
-# getting their own separate contract tests, per this module's docstring.
+# M2's simulated adapters (plus M4's EV charger/water heater/grid) extend
+# this suite's parametrization rather than getting their own separate
+# contract tests, per this module's docstring.
 SIMULATED_ADAPTERS = [
     SimulatedPVAdapter,
     SimulatedBatteryAdapter,
     SimulatedLoadAdapter,
     SimulatedGeneratorAdapter,
+    SimulatedEVChargerAdapter,
+    SimulatedWaterHeaterAdapter,
+    SimulatedGridConnectionAdapter,
 ]
 
 ALL_ADAPTERS = ALL_FAKE_ADAPTERS + SIMULATED_ADAPTERS
@@ -72,11 +79,13 @@ POWER_CONTROLLABLE_ADAPTERS = [
     FakeLoadAdapter,
     SimulatedBatteryAdapter,
     SimulatedLoadAdapter,
+    SimulatedEVChargerAdapter,
 ]
 
 STATE_OF_CHARGE_ADAPTERS = [
     FakeBatteryStorageAdapter,
     SimulatedBatteryAdapter,
+    SimulatedEVChargerAdapter,
 ]
 
 

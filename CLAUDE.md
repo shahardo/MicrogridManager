@@ -11,10 +11,10 @@ a single microgrid to utility-wide orchestration of many microgrids, unifies rea
 hardware control and simulation behind one control interface, and assumes
 multi-tenant ownership with intermittent connectivity between tiers.
 
-Current status: Phase 1 implementation, M3 (local telemetry store) complete;
-following the phased roadmap in `docs/architecture.md` §6 and
-`docs/phase-1-dev-plan.md`, starting with a single-site controller +
-simulation.
+Current status: Phase 1 implementation, M4 (extended simulated environment &
+dashboard, with replay) complete; following the phased roadmap in
+`docs/architecture.md` §6 and `docs/phase-1-dev-plan.md`, starting with a
+single-site controller + simulation.
 
 ## Working conventions (always follow these)
 
@@ -69,6 +69,26 @@ simulation.
     functions. New adapter constructors take only `asset_id` as a positional
     arg (everything else keyword, defaulted) so they drop straight into the
     M1 contract suite's `adapter_cls("asset-1")` parametrization.
+  - **M4 additions**, behind the same M1 interface (no interface changes):
+    `ev_charger.py` (`SimulatedEVChargerAdapter` — `PowerControllable` +
+    `StateOfChargeReadable`; a session-based load driven by a list of
+    `EVSession(plug_in, deadline, target_soc)`: while plugged in and below
+    target it auto-charges at rated power exactly like the generator's
+    internal setpoint, but `set_active_power_w` overrides that decision —
+    same override pattern as `load.py` — so M7's dispatcher can shape the
+    charge curve later without this adapter changing), `water_heater.py`
+    (`SimulatedWaterHeaterAdapter` — no capability mixins, self-managing: a
+    virtual tank depletes against a `WaterDrawProfile` and the heating
+    element cycles on/off with hysteresis between `low_fraction`/
+    `high_fraction`), `grid.py` (`SimulatedGridConnectionAdapter` — the PCC
+    pseudo-asset; not independently controllable, `set_net_power_w()` records
+    whatever residual import(+)/export(-) the scenario computes and `step()`
+    integrates cumulative energy; `get_state()` reports the current
+    `TariffProfile` price and `peek_price(at)` reads the price at an
+    arbitrary time for the dashboard's projected-price decision variable
+    without side effects). `profiles.py` gained
+    `household_water_draw_profile()` and `time_of_use_tariff_profile()`
+    alongside the M2 profiles.
 - `simulation/` — not part of the installed package; run via
   `python -m simulation.runner` (needs `pythonpath = ["."]` in
   `pyproject.toml`'s pytest config, already set, for tests to import it too).
@@ -78,14 +98,46 @@ simulation.
     PV, discharge to cover shortfalls, generator only above a 1W shortfall
     dead-band). This is *not* the real dispatch engine (M7) — it exists only
     to exercise the M2 adapters end-to-end.
-  - `runner.py` — CLI: `--scenario`, `--step-seconds`, `--duration-hours`,
-    `--output`, `--telemetry-db`, `--run-id`; writes the scenario's per-step
-    readings to CSV (`output/normal_day.csv` by default; `output/` is
-    gitignored) **and** records every non-timestamp field of every row into
-    the M3 `TelemetryStore` under an auto-generated (or `--run-id`-supplied)
-    run id (`output/telemetry.db` by default). `record_telemetry()` is the
-    one place that translates a scenario's row-dict output into telemetry
-    samples — the scenario/adapter code itself stays telemetry-agnostic.
+  - `scenarios/household_day.py` — **M4's six-device scenario**: rooftop PV,
+    battery, household load, EV charger, water heater, grid connection, all
+    on one clock. Same self-consumption battery rule as `normal_day`, but
+    with no generator — whatever residual import/export is left after the
+    battery is sent to `grid.set_net_power_w()`. The EV charger and water
+    heater manage their own charge/reheat decisions internally (see their
+    adapters above); this scenario just steps them and reads status.
+    `step_scenario()` returns one flat dict per tick (18 fields — every
+    device's power/status plus tariff price) that both `runner.py` (batch)
+    and `live_engine.py` (live) feed into the telemetry store unchanged.
+  - `runner.py` — CLI: `--scenario` (`normal_day` or `household_day`),
+    `--step-seconds`, `--duration-hours`, `--output`, `--telemetry-db`,
+    `--run-id`; writes the scenario's per-step readings to CSV
+    (`output/<scenario>.csv` by default; `output/` is gitignored) **and**
+    records every non-timestamp field of every row into the M3
+    `TelemetryStore` under an auto-generated (or `--run-id`-supplied) run id
+    (`output/telemetry.db` by default). `record_telemetry()` is the one place
+    that translates a scenario's row-dict output into telemetry samples — the
+    scenario/adapter code itself stays telemetry-agnostic.
+  - `live_engine.py` — **M4's `SimulationEngine`**: drives `household_day`
+    one `tick()` at a time (rather than a fixed batch loop) so the dashboard
+    can show it running live. Adds the M4 dashboard's placeholder
+    forecast/decision-variable fields to each tick's row
+    (`pv_power_forecast_w`/`household_load_power_forecast_w` — persistence,
+    i.e. last tick's actual, from `microgridmanager.dashboard.placeholders`;
+    `battery_soc_headroom`; `charge_rule_output_w`; `grid_connected`;
+    `grid_projected_import/export_price_per_kwh` via `grid.peek_price()`)
+    before recording to telemetry and appending to a rolling in-memory
+    `history` deque the live charts read from. Exposes `start()`/`pause()`/
+    `reset()`/`set_speed()`/`set_grid_connected()` for the controls panel.
+    Deliberately lives under `simulation/` (not the installed package) since
+    it wires up one specific scenario, mirroring `runner.py`'s role for batch
+    runs — see its module docstring for the small duck-typed interface
+    `microgridmanager.dashboard.app` depends on instead of importing this
+    directly, so the installed dashboard package stays scenario-agnostic
+    (M9 can point it at a real site controller without changing it).
+  - `dashboard_runner.py` — CLI (`python -m simulation.dashboard_runner`,
+    `make run-dashboard`) wiring a `TelemetryStore` + `SimulationEngine` into
+    `microgridmanager.dashboard.app.create_app()` and serving it with
+    `uvicorn`. Flags: `--host`, `--port`, `--telemetry-db`, `--step-seconds`.
 - `src/microgridmanager/telemetry/store.py` — **the M3 append-only telemetry
   store** (`TelemetryStore`, `TelemetrySample`). SQLite-backed, long/narrow
   schema (`run_id`, `timestamp`, `asset_id` (nullable), `series`, `value`) —
@@ -97,7 +149,41 @@ simulation.
   previously written — verified by
   `tests/unit/telemetry/test_store.py::test_persistence_survives_reopen`.
   **Every milestone from here on should write through this store** rather
-  than inventing a parallel persistence mechanism.
+  than inventing a parallel persistence mechanism. Since M4, the underlying
+  SQLite connection is opened with `check_same_thread=False` and every method
+  is guarded by a `threading.Lock` — the dashboard's background simulation
+  loop (asyncio event-loop thread) and its request handlers (FastAPI's sync
+  endpoints run in a thread pool) both touch the same store concurrently.
+- `src/microgridmanager/dashboard/` — **M4's dashboard**: a FastAPI service
+  (`app.py`) plus a static vanilla-JS/canvas page (`static/`), no frontend
+  build step. `create_app(engine, telemetry_store, *, tick_interval_seconds)`
+  is intentionally scenario-agnostic — `engine` only needs to satisfy the
+  small `LiveEngine` protocol documented in `app.py` (`running`/`speed`/
+  `grid_connected`/`run_id`/`history` plus `start()`/`pause()`/`reset()`/
+  `set_speed()`/`set_grid_connected()`/`tick()`), so this module never
+  imports from `simulation/`; `simulation/dashboard_runner.py` does the
+  wiring. Runs a background `asyncio` task (started/stopped via the FastAPI
+  `lifespan`) that calls `engine.tick()` on a timer scaled by `engine.speed`
+  whenever `engine.running` is true. Endpoints: `GET /api/state` (running/
+  speed/grid_connected/run_id/latest reading), `GET /api/history?limit=`
+  (recent rows for live charts), `POST /api/controls/{start,pause,reset}`,
+  `POST /api/controls/speed` `{speed}`, `POST /api/controls/grid`
+  `{connected}` (the manual grid connect/disconnect toggle — no physical
+  effect yet, it only drives the placeholder island indicator; M5 wires it to
+  the real protection state machine), `GET /api/runs` /
+  `GET /api/runs/{run_id}/series` (thin wrappers over `TelemetryStore`), and
+  `GET /api/runs/{run_id}/data` (every series for a run, bundled for
+  replay). `placeholders.py` holds `persistence_forecast()` — the inline
+  stand-in for M6's real forecasting model; M6/M7 replace the *callers* of
+  these functions without changing the dashboard panels, since the series
+  names stay the same (the tracked placeholder-to-real swaps from the Phase 1
+  plan). `static/app.js` polls `/api/state` + `/api/history` every second in
+  Live mode; Replay mode lists `/api/runs`, loads one run's
+  `/api/runs/{id}/data`, reconstructs per-tick rows by indexing every
+  series array position-for-position (`reconstructRows`), and scrubs through
+  them client-side (play/pause/seek/speed) reusing the same card/chart
+  renderers as the live view — proven to reproduce the live data exactly by
+  `tests/unit/dashboard/test_replay.py`.
 - `scripts/query_telemetry.py` — **M3's visible result**: CLI over the
   telemetry store. No `--run-id` lists runs; `--run-id` alone lists that
   run's series; `--run-id` + `--series` (optionally + `--asset-id`) prints
@@ -107,27 +193,50 @@ simulation.
   - `tests/unit/adapters/` — the **adapter contract test suite**: `fakes.py`
     (minimal in-memory test-double adapters), `contracts.py` (reusable
     `assert_*_contract` functions, one per capability), and
-    `test_contract_suite.py` (parametrized checks, now covering both the
-    fakes and the M2 simulated adapters — `SimulatedGeneratorAdapter` is
-    excluded from the generic `PowerControllable` round-trip check since it
-    clamps setpoints, and instead gets a dedicated clamp test). New adapter
+    `test_contract_suite.py` (parametrized checks, now covering the fakes,
+    the M2 simulated adapters, and the M4 EV charger/water heater/grid
+    adapters — `SimulatedGeneratorAdapter` is excluded from the generic
+    `PowerControllable` round-trip check since it clamps setpoints, and
+    instead gets a dedicated clamp test; `SimulatedEVChargerAdapter` *is*
+    included in that generic check since its override setter round-trips
+    unclamped, same as the battery/load adapters). New adapter
     implementations should be added to this suite's parametrization rather
     than given their own separate contract tests.
-  - `tests/unit/adapters/simulated/` — physics unit tests per M2 adapter
+  - `tests/unit/adapters/simulated/` — physics unit tests per M2/M4 adapter
     (SoC bounds/efficiency, PV tracking irradiance, generator fuel curve and
-    rated-power clamping, clock advancement).
+    rated-power clamping, clock advancement, EV session plug/unplug and
+    target-SoC charging, water heater hysteresis and tank bounds, grid
+    cumulative import/export energy and tariff timing).
   - `tests/scenarios/test_normal_day.py` — the M2 exit-criteria test: a full
     simulated day runs without errors and produces plausible output (SoC
     stays in bounds, generator only fires on a genuine shortfall, fuel use is
     monotonic, CSV round-trips correctly).
+  - `tests/scenarios/test_household_day.py` — the M4 exit-criteria test:
+    the six-device day runs without errors (battery/EV SoC and water heater
+    tank fraction stay in bounds, PV/EV power stay within rated limits, the
+    EV only draws power while plugged in, grid cumulative energy is
+    monotonic, the tariff actually switches peak/off-peak, and the grid's
+    reported power always equals the residual of every other device's
+    balance).
+  - `tests/unit/dashboard/` — `test_app.py` drives the FastAPI app's API
+    (state/history/controls/runs/series) via `TestClient`, ticking the engine
+    manually rather than relying on the real-time background loop so tests
+    stay deterministic; `test_replay.py` is the M4 replay exit-criteria test
+    — it ticks a `SimulationEngine` directly, captures the exact rows
+    returned, then asserts `GET /api/runs/{run_id}/data` reconstructs those
+    same rows value-for-value and timestamp-for-timestamp.
 - `pyproject.toml` — project config; dependencies managed with `uv`
   (`uv sync --group dev` creates `.venv` and installs everything — never
   install packages globally). No new runtime dependencies were added through
   M3 (kept dependency-light per the project's zero-ops bias — CSV output and
   the telemetry store use only the standard library, `csv` and `sqlite3`).
+  M4 adds `fastapi` and `uvicorn[standard]` as runtime dependencies (per the
+  Phase 1 tech stack table) and `httpx` to the `dev` group (required by
+  FastAPI's `TestClient`).
 - `Makefile` — `make test` (pytest), `make lint` (ruff), `make run-scenario`
-  (runs the M2 normal-day scenario, now also recording to the M3 telemetry
-  store), `make query-telemetry ARGS="..."` (M3's CLI); `make run-dashboard`
-  is a stub until the dashboard (M4/M9) exists. Native Windows PowerShell
+  (runs the M2 normal-day scenario by default; pass `ARGS="--scenario
+  household_day"` for M4's six-device scenario), `make query-telemetry
+  ARGS="..."` (M3's CLI), `make run-dashboard` (M4's dashboard — starts a
+  uvicorn server at `http://127.0.0.1:8000`). Native Windows PowerShell
   usually does not ship with `make`, so Windows users should run the
   equivalent `uv run ...` commands directly instead of `make`.

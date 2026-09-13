@@ -21,6 +21,9 @@ class AssetType(str, Enum):
     LOAD = "load"
     BREAKER = "breaker"
     METER = "meter"
+    EV_CHARGER = "ev_charger"
+    WATER_HEATER = "water_heater"
+    GRID = "grid"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -63,6 +66,42 @@ class BreakerState(AssetState):
 class MeterState(AssetState):
     active_power_w: float
     cumulative_energy_wh: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class EVChargerState(AssetState):
+    """A session-based controllable-load asset (M4): a car plugs in, charges
+    toward a target state of charge by a deadline, then unplugs."""
+
+    active_power_w: float
+    plugged_in: bool
+    charging: bool
+    state_of_charge: float  # 0.0-1.0
+    target_state_of_charge: float
+    time_remaining_s: float | None  # None when not plugged in
+
+
+@dataclass(frozen=True, kw_only=True)
+class WaterHeaterState(AssetState):
+    """A thermal-storage-style controllable-load asset (M4): a virtual tank
+    depletes against a hot-water draw schedule and is reheated by cycling an
+    electric heating element."""
+
+    active_power_w: float  # electrical draw of the heating element
+    tank_energy_fraction: float  # 0.0-1.0
+    heating: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class GridState(AssetState):
+    """The point-of-common-coupling pseudo-asset (M4): import/export
+    metering plus the current time-of-use tariff price."""
+
+    active_power_w: float  # positive = importing from the grid, negative = exporting
+    cumulative_import_wh: float
+    cumulative_export_wh: float
+    import_price_per_kwh: float
+    export_price_per_kwh: float
 
 
 class AssetAdapter(ABC):

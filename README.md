@@ -33,14 +33,16 @@ implementation roadmap.
 
 ## Status
 
-**Implementation in progress (Phase 1, M3 — local telemetry store).** The
-architecture and Phase 1 plan are defined (see `docs/architecture.md` §6 and
-`docs/phase-1-dev-plan.md`). M1 delivered the canonical asset model and
-`AssetAdapter` interface; M2 added simulated PV, battery (BESS), controllable
-load, and diesel/gas generator adapters plus a shared discrete-time
-simulation clock, and a scripted "normal day" scenario that exercises them
-end-to-end; M3 adds a durable, queryable telemetry store — every scenario run
-is now recorded and inspectable after the fact.
+**Implementation in progress (Phase 1, M4 — extended simulated environment &
+dashboard, with replay).** The architecture and Phase 1 plan are defined (see
+`docs/architecture.md` §6 and `docs/phase-1-dev-plan.md`). M1 delivered the
+canonical asset model and `AssetAdapter` interface; M2 added simulated PV,
+battery (BESS), controllable load, and diesel/gas generator adapters plus a
+shared discrete-time simulation clock, and a scripted "normal day" scenario
+that exercises them end-to-end; M3 added a durable, queryable telemetry
+store; M4 adds an EV charger, a water heater, and a grid connection (with a
+time-of-use tariff) as three more simulated devices, a six-device "household
+day" scenario combining all of them, and a live/replay web dashboard.
 
 ## Development setup
 
@@ -78,20 +80,34 @@ Native PowerShell does not include `make` by default, so `make test` may fail wi
 ## Running a simulation scenario
 
 `make run-scenario` (or, on Windows, `uv run python -m simulation.runner`)
-steps a scripted 24-hour "normal day" through the M2 simulated adapters —
-rooftop PV, a battery, a household-shaped load, and a backup generator —
-using a fixed self-consumption control rule (charge the battery from excess
-solar, discharge to cover shortfalls, fall back to the generator only if the
-battery can't keep up). This is not the real dispatch engine (that lands in
-M7) — it exists purely to produce visible, inspectable output from the
-simulated physics.
+steps a scripted 24-hour scenario through the simulated adapters. Two
+scenarios are available (`--scenario`, default `normal_day`):
 
-The run writes a CSV time series (default `output/normal_day.csv`) with
-each step's PV/load/battery/generator power, battery state of charge, and
-cumulative generator fuel use — open it in a spreadsheet or plotting tool to
-see the day play out. It also records every one of those readings into the
+- **`normal_day`** (M2) — rooftop PV, a battery, a household-shaped load, and
+  a backup generator, using a fixed self-consumption control rule (charge the
+  battery from excess solar, discharge to cover shortfalls, fall back to the
+  generator only if the battery can't keep up).
+- **`household_day`** (M4) — the same PV/battery/household load, plus an EV
+  charger (plugs in overnight and again in the evening, auto-charges toward
+  a target state of charge by a deadline), a water heater (a virtual tank
+  that depletes against a morning/evening hot-water draw and cycles its
+  heating element to reheat), and a grid connection with a time-of-use
+  tariff, absorbing whatever import/export is left over after the battery.
+
+Neither is the real dispatch engine (that lands in M7) — they exist purely to
+produce visible, inspectable output from the simulated physics.
+
+```bash
+make run-scenario                                    # normal_day (default)
+make run-scenario ARGS="--scenario household_day"     # the M4 six-device scenario
+```
+
+The run writes a CSV time series (default `output/<scenario>.csv`) with every
+device's power/status each step — open it in a spreadsheet or plotting tool
+to see the day play out. It also records every one of those readings into the
 M3 telemetry store (default `output/telemetry.db`) for later inspection —
-see "Querying telemetry" below. Options: `--scenario`, `--step-seconds`,
+see "Querying telemetry" below, or view it live in the dashboard's replay
+mode (see "Running the dashboard"). Options: `--scenario`, `--step-seconds`,
 `--duration-hours`, `--output`, `--telemetry-db`, `--run-id`.
 
 ## Querying telemetry
@@ -109,6 +125,31 @@ make query-telemetry ARGS="--run-id <run> --series pv_power_w"   # print a serie
 
 On Windows PowerShell, run the script directly instead of through `make`,
 e.g. `uv run python scripts/query_telemetry.py --run-id <run> --series pv_power_w`.
+
+## Running the dashboard
+
+`make run-dashboard` (or, on Windows,
+`uv run python -m simulation.dashboard_runner`) starts a web dashboard at
+<http://127.0.0.1:8000> over the M4 `household_day` scenario:
+
+- **Live mode** runs the six-device scenario in the background — Start/
+  Pause/Reset controls, a speed multiplier, and a manual grid connect/
+  disconnect toggle (a placeholder for now; M5 wires it to the real
+  protection state machine) — showing each device's status card and live
+  power/storage-level/tariff/forecast charts as it plays out. Every live tick
+  is also recorded to the telemetry store, so a live session can be replayed
+  later exactly like any other run.
+- **Replay mode** lists every run recorded in the telemetry store (from
+  `make run-scenario` or a previous live session) and lets you play/pause/
+  seek/speed through it using the same device cards and charts.
+
+The forecast panel and the "decision variables" panel (current/projected
+tariff price, battery SoC headroom, the self-consumption rule's output, the
+grid-connect indicator) ship with small inline placeholders standing in for
+the real forecasting (M6) and dispatch (M7) engines, which don't exist yet —
+those milestones swap in real data without changing the panels.
+
+Options: `--host`, `--port`, `--telemetry-db`, `--step-seconds`.
 
 ## Development conventions
 

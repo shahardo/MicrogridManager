@@ -3,10 +3,14 @@ name = "microgridmanager"
 version = "0.1.0"
 description = "Distributed Microgrid Management System"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.4",
+]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=8.0",
     "ruff>=0.6",
 ]

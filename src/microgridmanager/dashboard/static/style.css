@@ -1,0 +1,168 @@
+:root {
+  color-scheme: light;
+  --bg: #f4f6f8;
+  --panel-bg: #ffffff;
+  --border: #d9dee3;
+  --text: #1f2933;
+  --muted: #64748b;
+  --accent: #2563eb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar h1 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.subtitle {
+  color: var(--muted);
+  font-weight: normal;
+  font-size: 14px;
+}
+
+.mode-switch {
+  display: flex;
+  gap: 6px;
+}
+
+.mode-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.mode-btn.active {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+.panel {
+  margin: 14px 20px;
+  padding: 14px 16px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.panel h2 {
+  margin: 0 0 10px 0;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.controls-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.controls-row.hidden {
+  display: none;
+}
+
+.controls-row button {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #eef2f6;
+  cursor: pointer;
+}
+
+.controls-row input[type="number"] {
+  width: 70px;
+}
+
+.run-id {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+  font-family: monospace;
+}
+
+.device-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 10px;
+}
+
+.card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fafcff;
+}
+
+.card h3 {
+  margin: 0 0 6px 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.card .metric {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  padding: 1px 0;
+}
+
+.card .metric .value {
+  font-weight: 600;
+}
+
+canvas {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fdfefe;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #0f172a;
+    --panel-bg: #1e293b;
+    --border: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #3b82f6;
+  }
+
+  .card {
+    background: #16223a;
+  }
+
+  canvas {
+    background: #101a2e;
+  }
+
+  .controls-row button {
+    background: #24344f;
+    color: var(--text);
+  }
+}

@@ -16,10 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from microgridmanager.telemetry import TelemetrySample, TelemetryStore
-from simulation.scenarios import normal_day
+from simulation.scenarios import household_day, normal_day
 
 SCENARIOS = {
     "normal_day": normal_day.run,
+    "household_day": household_day.run,
 }
 
 DEFAULT_OUTPUT_DIR = Path("output")
