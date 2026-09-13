@@ -33,11 +33,13 @@ implementation roadmap.
 
 ## Status
 
-**Implementation started (Phase 1, M1 — canonical asset model & adapter
-interface).** The
+**Implementation in progress (Phase 1, M2 — simulated adapters).** The
 architecture and Phase 1 plan are defined (see `docs/architecture.md` §6 and
-`docs/phase-1-dev-plan.md`); a single-site controller running against
-simulated hardware is being built first.
+`docs/phase-1-dev-plan.md`). M1 delivered the canonical asset model and
+`AssetAdapter` interface; M2 adds simulated PV, battery (BESS), controllable
+load, and diesel/gas generator adapters plus a shared discrete-time
+simulation clock, and a scripted "normal day" scenario that exercises them
+end-to-end.
 
 ## Development setup
 
@@ -49,7 +51,25 @@ installed globally.
 uv sync --group dev   # creates .venv and installs dependencies
 make test              # run the test suite (uv run pytest)
 make lint               # run the linter (uv run ruff check .)
+make run-scenario       # run the "normal day" simulation, writes output/normal_day.csv
 ```
+
+## Running a simulation scenario
+
+`make run-scenario` (or `uv run python -m simulation.runner`) steps a
+scripted 24-hour "normal day" through the M2 simulated adapters — rooftop
+PV, a battery, a household-shaped load, and a backup generator — using a
+fixed self-consumption control rule (charge the battery from excess solar,
+discharge to cover shortfalls, fall back to the generator only if the
+battery can't keep up). This is not the real dispatch engine (that lands in
+M7) — it exists purely to produce visible, inspectable output from the
+simulated physics.
+
+The run writes a CSV time series (default `output/normal_day.csv`) with
+each step's PV/load/battery/generator power, battery state of charge, and
+cumulative generator fuel use — open it in a spreadsheet or plotting tool to
+see the day play out. Options: `--scenario`, `--step-seconds`,
+`--duration-hours`, `--output`.
 
 ## Development conventions
 
