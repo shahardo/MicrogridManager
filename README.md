@@ -33,9 +33,22 @@ implementation roadmap.
 
 ## Status
 
-**Design phase.** The architecture is defined; implementation has not started
-yet. The roadmap begins with a single-site controller running against
-simulated hardware (see `docs/architecture.md` §6).
+**Implementation started (Phase 1, M0 — project scaffolding).** The
+architecture and Phase 1 plan are defined (see `docs/architecture.md` §6 and
+`docs/phase-1-dev-plan.md`); a single-site controller running against
+simulated hardware is being built first.
+
+## Development setup
+
+Requires Python 3.11+ and [`uv`](https://docs.astral.sh/uv/). All dependencies
+are installed into a project-local virtual environment (`.venv`) — nothing is
+installed globally.
+
+```bash
+uv sync --group dev   # creates .venv and installs dependencies
+make test              # run the test suite (uv run pytest)
+make lint               # run the linter (uv run ruff check .)
+```
 
 ## Development conventions
 

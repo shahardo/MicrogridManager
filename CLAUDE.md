@@ -40,4 +40,16 @@ single-site controller + simulation.
 ## Repository layout
 
 - `docs/architecture.md` — the conceptual design and phased roadmap.
-- (Source directories will be documented here as they are added.)
+- `docs/phase-1-dev-plan.md` — the detailed, milestone-by-milestone Phase 1 plan.
+- `src/microgridmanager/` — the installable package (`assets/`, `adapters/`
+  with `simulated/`/`real/` splits, `protection/`, `forecasting/`,
+  `dispatch/`, `telemetry/`, `dashboard/`) — currently empty package
+  skeletons, filled in milestone by milestone per the Phase 1 plan.
+- `tests/` — `unit/`, `integration/`, `scenarios/` (added as milestones need
+  them).
+- `pyproject.toml` — project config; dependencies managed with `uv`
+  (`uv sync --group dev` creates `.venv` and installs everything — never
+  install packages globally).
+- `Makefile` — `make test` (pytest), `make lint` (ruff); `make run-dashboard`
+  / `make run-scenario` are stubs until the dashboard (M4/M9) and simulation
+  runner (M2) exist.
