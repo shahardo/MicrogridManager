@@ -37,19 +37,21 @@ expensive to reverse later.
 
 ```
 src/microgridmanager/
-  assets/            # canonical asset model (PV, BESS, generator, load, breaker, meter)
+  assets/            # canonical asset model (PV, BESS, generator, load, breaker, meter,
+                     #   ev_charger, water_heater — the latter two added in M4)
   adapters/
     interface.py     # AssetAdapter abstract interface — the load-bearing seam
-    simulated/        # simulated adapters (physics/behavior models)
+    simulated/        # simulated adapters (physics/behavior models), incl. grid tariff feed
     real/              # real adapters (modbus, sunspec)
   protection/         # islanding/black-start/load-shedding state machine
   forecasting/         # load & PV/wind forecast interface + baseline models
   dispatch/            # rolling-horizon economic dispatch engine
   telemetry/           # append-only store, query API
   site_controller.py  # wires the above into one control loop
-  dashboard/           # FastAPI app + minimal UI
+  dashboard/           # FastAPI app + minimal UI, incl. replay.py (M4)
 simulation/
-  scenarios/           # YAML/JSON scenario definitions (weather, load profile, events)
+  scenarios/           # YAML/JSON scenario definitions (weather, load profile, EV/water-
+                     #   heater schedules, tariff curve, events)
   runner.py            # drives a site_controller against simulated adapters + a scenario
 tests/
   unit/
@@ -103,6 +105,8 @@ tests, and exit criteria. Do them in order — each depends on the previous.
   adapter.
 - **Exit criteria**: interface is stable enough that M2 can build against it
   without changing it; contract tests documented in `tests/unit/adapters/`.
+  (Two more controllable-load kinds — EV charger, water heater — are added in
+  M4 behind this same interface, without changing it.)
 
 ### M2 — Simulated adapters (core asset types)
 - Implement simulated adapters: PV (irradiance-profile driven output), BESS
@@ -130,18 +134,77 @@ tests, and exit criteria. Do them in order — each depends on the previous.
 - **Exit criteria**: every milestone from here on writes through this store, so
   every scenario run leaves an inspectable record.
 
-### M4 — Protection & control state machine
+### M4 — Extended simulated environment & dashboard (with replay)
+- Extend the M2 simulated environment into a realistic household/rooftop
+  scenario with six simulated devices, adding two new controllable-load asset
+  kinds behind the **same M1 `AssetAdapter` interface** (no interface changes):
+  - **Rooftop PV source** — M2's PV adapter, parameterized for a rooftop array
+    (capacity, orientation-adjusted irradiance profile).
+  - **Battery storage** — M2's BESS adapter, unchanged.
+  - **Household consumer** — M2's generic Load adapter, given a realistic
+    household daily profile (morning/evening peaks).
+  - **Electric car (EV charger)** — new `EVCharger` asset: a session-based load
+    that plugs in/out on a schedule and charges toward a target SoC/energy by a
+    deadline; reports plugged/charging state, target, and time remaining.
+  - **Water heater** — new `WaterHeater` asset: a thermal-storage-style load
+    that maintains a virtual tank's energy level, depletes it against a hot-
+    water demand schedule (morning/evening draws), and cycles its heating
+    element to reheat.
+  - **Outside grid connection** — a `Grid` pseudo-asset at the point of common
+    coupling: import/export metering plus a real-time (or time-of-use) tariff
+    feed (an import/export price series over the scenario horizon).
+- Extend the M3 telemetry schema to capture every device's status fields and
+  the tariff price series, so a completed run can be fully replayed later.
+- Build the project's dashboard (this pulls forward the dashboard work from
+  later in the plan, since visibility is wanted this early): a FastAPI service
+  + minimal web page with:
+  - **Device status panel**: one card per device (PV, battery, household load,
+    EV charger, water heater, grid connection) showing current power, SoC/tank
+    level/session state, and tariff price.
+  - **Operation charts**: time series of per-device power, battery SoC, water
+    heater tank level, EV session progress, and import/export price.
+  - **Forecast panel**: load/PV forecast vs. actual. The real forecasting
+    engine doesn't exist yet (M6), so this ships with a small inline
+    placeholder forecast (e.g. persistence) purely so the panel has real data
+    to chart; M6 swaps in the real model without changing the panel.
+  - **Decision-variables panel**: the internal signals a controller would use
+    — current/projected tariff price, battery SoC headroom, and a placeholder
+    charge/discharge rule's output. Also a placeholder grid-connect/island
+    indicator. Both are wired to the real protection (M5) and dispatch (M7)
+    modules once those land, without changing the panel.
+  - **Controls panel**: scenario controls (start/pause/reset, speed
+    multiplier) and a manual **grid connect/disconnect toggle** — this becomes
+    the input signal M5's protection state machine consumes later.
+  - **Replay mode**: load any completed run from the M3 telemetry store and
+    scrub through it (play/pause/seek/speed) using the same charts/panels as
+    the live view, sourced from historical data — this is what lets past
+    behavior be analyzed after the fact.
+- **Visible result**: `make run-dashboard` shows all six devices' live status
+  and charts updating in a browser; a second mode lets you pick a completed run
+  and replay it.
+- **Tests**: unit tests for the two new adapters (EV session/target logic,
+  water-heater tank depletion/reheat logic) against the M1 contract suite;
+  API/schema tests for the new dashboard endpoints; a replay test asserting
+  replaying a stored run reproduces the same chart data as the original live
+  run.
+- **Exit criteria**: the six-device scenario runs end-to-end and is fully
+  visible live and in replay; every later milestone (M5–M7) only has to wire
+  its new subsystem into an existing panel, not build new UI.
+
+### M5 — Protection & control state machine
 - Implement the explicit state machine from the architecture doc: `Normal
   (grid-connected)` ↔ `Islanding-transition` ↔ `Islanded` ↔ `Black-start` ↔
   `Restoration`, plus load-shedding priority tiers.
-- Drive it from a simulated grid-connection signal (can be toggled by a scenario
-  event, e.g. "grid fault at t=2h").
+- Drive it from the grid-connection signal (the M4 dashboard's manual toggle,
+  or a scenario event, e.g. "grid fault at t=2h").
 - Wire it as the **final gate** in front of every adapter write — no control
   signal reaches an adapter without passing through this layer, per the
   architecture doc's safety invariant.
+- Replace the M4 dashboard's placeholder grid-connect/island indicator with
+  this module's real state.
 - **Visible result**: a scenario ("outage + black-start + restoration") whose
-  output plot/log clearly shows the state transitions over time and which loads
-  were shed and restored, in what order.
+  output plot/log — and now the M4 dashboard, live — clearly shows the state
+  transitions over time and which loads were shed and restored, in what order.
 - **Tests**: unit tests for every transition's guard condition; a scenario test
   asserting critical loads stay powered throughout a simulated outage and
   non-critical loads shed/restore in the configured priority order.
@@ -149,28 +212,34 @@ tests, and exit criteria. Do them in order — each depends on the previous.
   enforced by code structure (adapters only reachable through the protection
   layer's apply path), not by convention.
 
-### M5 — Forecasting
+### M6 — Forecasting
 - Define the forecasting interface (historical series in → probabilistic/point
   forecast out).
 - Implement a baseline model (e.g. persistence or same-day-last-week average) for
   load and PV.
+- Replace the M4 dashboard's placeholder forecast panel with this module's real
+  output.
 - **Visible result**: a forecast-vs-actual plot/report generated from a scenario
-  run, with an error metric (MAE/MAPE) printed.
+  run, with an error metric (MAE/MAPE) printed, now shown live in the M4
+  dashboard's forecast panel.
 - **Tests**: forecast accuracy within a defined bound on synthetic data with known
   patterns; interface contract test so future ML-based models are swappable.
-- **Exit criteria**: dispatch (M6) can consume forecasts without knowing which
+- **Exit criteria**: dispatch (M7) can consume forecasts without knowing which
   model produced them.
 
-### M6 — Optimization / dispatch engine
+### M7 — Optimization / dispatch engine
 - Implement the rolling-horizon economic dispatch engine (LP via PuLP to start):
-  minimize cost given forecasted load/PV, battery constraints, and a simple
-  time-of-use or flat price signal; output per-asset setpoints for the next
-  control window.
+  minimize cost given forecasted load/PV, battery constraints, and the M4
+  `Grid` asset's tariff signal; output per-asset setpoints for the next
+  control window (including EV charging and water-heater reheat timing).
 - Wire it into `site_controller.py`'s main loop: forecast → dispatch → protection
   gate → adapters → telemetry, on a fixed tick.
+- Replace the M4 dashboard's placeholder decision-variables panel with this
+  module's real dispatch decisions.
 - **Visible result**: a scenario comparing "dispatch-optimized day" vs. "naive
-  baseline day" (e.g. battery never used vs. optimized), reporting the cost
-  difference — this is the first demonstrable value-add of the system.
+  baseline day" (e.g. battery/EV/water-heater never coordinated with price vs.
+  optimized), reporting the cost difference — shown in the M4 dashboard and
+  its replay mode.
 - **Tests**: dispatch always returns a feasible plan given feasible constraints;
   constraint violations (e.g. requesting more than rated power) are rejected/
   clamped before reaching adapters; integration test for the full control loop
@@ -178,7 +247,7 @@ tests, and exit criteria. Do them in order — each depends on the previous.
 - **Exit criteria**: full day-long scenario runs the real control loop (not just
   simulated physics) and produces a cost report.
 
-### M7 — Real adapters (Modbus / SunSpec)
+### M8 — Real adapters (Modbus / SunSpec)
 - Implement a Modbus-based real adapter satisfying the same `AssetAdapter`
   interface, targeting one common device profile (e.g. a SunSpec-compliant
   inverter/BESS register map).
@@ -193,22 +262,26 @@ tests, and exit criteria. Do them in order — each depends on the previous.
 - **Exit criteria**: `site_controller.py` can be configured to use either adapter
   set via config, with zero code changes elsewhere.
 
-### M8 — Local operator dashboard
-- FastAPI service exposing current site state, asset states, telemetry history,
-  and recent dispatch/protection decisions; minimal web page consuming that API
-  with a live-updating view (polling is fine for Phase 1) and manual override
-  controls (e.g. force island, override a setpoint) that route through the same
-  protection gate as automated control.
-- **Visible result**: this milestone *is* the UI update — running
-  `make run-dashboard` against a live scenario shows real-time site state in a
-  browser.
-- **Tests**: API endpoint tests (status codes, schema); a smoke test driving a
-  scenario and asserting the dashboard API reflects state changes as they happen.
-- **Exit criteria**: a non-technical reviewer can open the dashboard and see the
-  site's state, understand what the controller is doing, and issue a manual
-  override.
+### M9 — Dashboard integration & manual overrides
+- By now the M4 dashboard's placeholders are all backed by real modules
+  (protection state from M5, forecasts from M6, dispatch decisions from M7).
+  This milestone finishes the dashboard rather than rebuilding it: wire the
+  controls panel's manual overrides (e.g. force island, override a device
+  setpoint) to actually issue commands, routed through the same protection
+  gate as automated control — not just scenario-setup inputs anymore.
+- Add a per-device real/simulated adapter selector, backed by M8.
+- **Visible result**: issuing a manual override in the running dashboard
+  demonstrably changes device behavior in the live scenario, and an override
+  that would violate protection rules is visibly rejected.
+- **Tests**: override commands are applied when safe and rejected when not,
+  verified through the protection gate, not just the API layer; a smoke test
+  driving a scenario and asserting the dashboard API reflects state changes
+  (including override outcomes) as they happen.
+- **Exit criteria**: a non-technical reviewer can open the dashboard, see the
+  site's real state and decisions, and issue a manual override with a visible,
+  correctly-gated effect.
 
-### M9 — End-to-end validation & documentation
+### M10 — End-to-end validation & documentation
 - Run and record the three headline scenarios: normal operation, outage/black-
   start/restoration, and forecast-driven dispatch savings.
 - Update `README.md` (how to run the controller/dashboard/scenarios) and
@@ -232,10 +305,16 @@ tests, and exit criteria. Do them in order — each depends on the previous.
 ## Risks / open questions
 
 - **Optimization solver choice**: PuLP/LP assumes a linear cost model; if
-  nonlinear battery degradation costs matter early, revisit before M6.
-- **No physical hardware available yet**: M7's real adapter is validated only
+  nonlinear battery degradation costs matter early, revisit before M7.
+- **No physical hardware available yet**: M8's real adapter is validated only
   against `pymodbus`'s test server. Validating against an actual device should
   happen as soon as one is available, ideally without changing the adapter's
   public interface.
-- **Dashboard scope creep**: keep M8 to "see state + basic override" — a richer
-  frontend is a Phase 3+ concern once regional dashboards are needed too.
+- **Dashboard scope creep**: M4 ships a full multi-device dashboard with replay
+  earlier than a minimal plan would — keep it to "see state + charts + forecast
+  + decisions + replay," and keep M9's overrides simple; a richer frontend is a
+  Phase 3+ concern once regional dashboards are needed too.
+- **Placeholder-to-real swaps (M4→M5/M6/M7)**: the M4 dashboard ships with
+  inline placeholder forecast/decision logic so it has real data to chart
+  before the real modules exist. Track these explicitly so none are
+  accidentally left in place once M5–M7 land.
