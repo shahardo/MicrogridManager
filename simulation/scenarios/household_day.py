@@ -37,6 +37,43 @@ from microgridmanager.adapters.simulated.profiles import (
 DEFAULT_START = datetime(2024, 6, 21, tzinfo=timezone.utc)
 DEFAULT_STEP_SECONDS = 300.0
 DEFAULT_DURATION_HOURS = 24.0
+DEFAULT_EV_SESSION_HORIZON_DAYS = 365
+
+
+def _daily_ev_sessions(
+    start: datetime,
+    *,
+    num_days: int = DEFAULT_EV_SESSION_HORIZON_DAYS,
+    evening_plug_in_hour: float = 18.0,
+    morning_deadline_hour: float = 6.0,
+    target_soc: float = 0.9,
+) -> list[EVSession]:
+    """A recurring daily commute pattern — plug in every evening, charge
+    overnight, unplug for the morning commute — repeated for `num_days`.
+
+    Without this, a scenario built with a fixed, one-off list of sessions
+    (the original M4 design) goes permanently flat — unplugged, 0 W, constant
+    state of charge — the moment the clock passes its last session. That's
+    invisible in a bounded 24h batch run but very visible as a flat EV line
+    the moment a live dashboard session runs past its first simulated day.
+    The first session starts at `start` itself (a charge already under way
+    from the previous evening), matching the original scenario's opening
+    behaviour.
+    """
+    day_start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    first_deadline = day_start + timedelta(hours=morning_deadline_hour)
+    if first_deadline <= start:
+        first_deadline += timedelta(days=1)
+    sessions = [EVSession(plug_in=start, deadline=first_deadline, target_soc=0.8)]
+
+    for day in range(num_days):
+        plug_in = day_start + timedelta(days=day, hours=evening_plug_in_hour)
+        deadline = day_start + timedelta(days=day + 1, hours=morning_deadline_hour)
+        if plug_in < start:
+            continue
+        sessions.append(EVSession(plug_in=plug_in, deadline=deadline, target_soc=target_soc))
+
+    return sessions
 
 
 @dataclass(frozen=True)
@@ -82,17 +119,11 @@ def build_scenario(
         capacity_wh=60_000.0,
         rated_power_w=7_200.0,
         initial_soc=0.3,
-        sessions=[
-            # Plugged in overnight from the previous evening, must reach 80%
-            # by the morning commute.
-            EVSession(plug_in=start, deadline=start + timedelta(hours=6), target_soc=0.8),
-            # Plugged back in after the evening commute.
-            EVSession(
-                plug_in=start + timedelta(hours=18),
-                deadline=start + timedelta(hours=24),
-                target_soc=0.9,
-            ),
-        ],
+        sessions=_daily_ev_sessions(start),
+        # A daily commute's worth of driving (~30 miles at ~300 Wh/mile) so
+        # the car actually needs the next overnight session's charge instead
+        # of arriving already at (or above) its target state of charge.
+        commute_energy_wh=9_000.0,
     )
     water_heater = SimulatedWaterHeaterAdapter(
         "water-heater-1",

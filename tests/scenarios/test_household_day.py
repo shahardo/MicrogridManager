@@ -67,6 +67,29 @@ def test_grid_absorbs_the_residual_power_balance() -> None:
         assert row["grid_power_w"] == residual_w
 
 
+def test_ev_charger_keeps_plugging_in_on_later_days() -> None:
+    """Regression test: the EV charger's sessions used to be a fixed,
+    one-off list covering only the scenario's first 24 hours, so a
+    longer-than-a-day run (exactly what the live dashboard does) went
+    permanently flat — unplugged, 0 W — the moment the clock passed the last
+    session. A recurring daily commute pattern should keep plugging the car
+    in every evening indefinitely."""
+    rows = household_day.run(step_seconds=1800.0, duration_hours=24.0 * 5)
+
+    day_length = 24 * 2  # 30-minute steps -> 48 rows/day
+    per_day_plugged_in = [
+        any(row["ev_plugged_in"] == 1.0 for row in rows[day * day_length : (day + 1) * day_length])
+        for day in range(5)
+    ]
+    assert all(per_day_plugged_in), "EV should plug in at least once on every one of the 5 days"
+
+    per_day_charging = [
+        any(row["ev_power_w"] > 0.0 for row in rows[day * day_length : (day + 1) * day_length])
+        for day in range(5)
+    ]
+    assert any(per_day_charging[1:]), "EV should still be charging on days after the first"
+
+
 def test_write_csv_produces_a_readable_file_with_all_rows(tmp_path: Path) -> None:
     rows = household_day.run(step_seconds=1800.0, duration_hours=6.0)
     output_path = tmp_path / "household_day.csv"

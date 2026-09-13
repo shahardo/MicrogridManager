@@ -88,11 +88,13 @@ scenarios are available (`--scenario`, default `normal_day`):
   battery from excess solar, discharge to cover shortfalls, fall back to the
   generator only if the battery can't keep up).
 - **`household_day`** (M4) — the same PV/battery/household load, plus an EV
-  charger (plugs in overnight and again in the evening, auto-charges toward
-  a target state of charge by a deadline), a water heater (a virtual tank
-  that depletes against a morning/evening hot-water draw and cycles its
-  heating element to reheat), and a grid connection with a time-of-use
-  tariff, absorbing whatever import/export is left over after the battery.
+  charger (plugs in every evening for the night, auto-charges toward a
+  target state of charge by the morning, and uses a commute's worth of
+  energy each day it's away — so it keeps needing a real charge indefinitely,
+  not just on the scenario's first day), a water heater (a virtual tank that
+  depletes against a morning/evening hot-water draw and cycles its heating
+  element to reheat), and a grid connection with a time-of-use tariff,
+  absorbing whatever import/export is left over after the battery.
 
 Neither is the real dispatch engine (that lands in M7) — they exist purely to
 produce visible, inspectable output from the simulated physics.

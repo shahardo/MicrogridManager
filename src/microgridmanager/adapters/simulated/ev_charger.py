@@ -11,6 +11,14 @@ immediately (so it round-trips through `get_state()` without needing a
 instead of its own auto-charge decision — mirroring `SimulatedLoadAdapter`'s
 override pattern, so a future dispatcher (M7) can shape the charge curve
 without this adapter changing.
+
+Each time the car goes from plugged-in to unplugged, `step()` also deducts
+`commute_energy_wh` (default 0, i.e. no effect) from the battery — modeling
+the energy used driving away. Without this, a car charged to its session
+target has nothing left to charge on any later day once replugged, which
+made a recurring daily schedule (see `simulation/scenarios/household_day.py`)
+still look flat after the first charge — plugged in and unplugged on
+schedule, but never drawing power again.
 """
 
 from __future__ import annotations
@@ -49,6 +57,7 @@ class SimulatedEVChargerAdapter(AssetAdapter, PowerControllable, StateOfChargeRe
         rated_power_w: float = 7_200.0,
         initial_soc: float = 0.4,
         sessions: list[EVSession] | None = None,
+        commute_energy_wh: float = 0.0,
     ) -> None:
         if not 0.0 <= initial_soc <= 1.0:
             raise ValueError("initial_soc must be within [0.0, 1.0]")
@@ -58,6 +67,8 @@ class SimulatedEVChargerAdapter(AssetAdapter, PowerControllable, StateOfChargeRe
         self._rated_power_w = rated_power_w
         self._energy_wh = capacity_wh * initial_soc
         self._sessions = sorted(sessions or [], key=lambda s: s.plug_in)
+        self._commute_energy_wh = commute_energy_wh
+        self._was_plugged_in = self._active_session() is not None
         self._override_w: float | None = None
         self._active_power_w = 0.0
 
@@ -116,9 +127,18 @@ class SimulatedEVChargerAdapter(AssetAdapter, PowerControllable, StateOfChargeRe
         """Decide this tick's charging power (the override if one is set,
         otherwise the auto-charge rule) and integrate state of charge over
         `dt_seconds`, clamping the applied power to what's actually
-        chargeable — a car can't charge past 100% or discharge (no V2G)."""
+        chargeable — a car can't charge past 100% or discharge (no V2G).
+
+        Also detects the plugged-in -> unplugged transition and, if so,
+        deducts `commute_energy_wh` once for that trip."""
+        session = self._active_session()
+        plugged_in = session is not None
+        if self._was_plugged_in and not plugged_in and self._commute_energy_wh > 0.0:
+            self._energy_wh = max(0.0, self._energy_wh - self._commute_energy_wh)
+        self._was_plugged_in = plugged_in
+
         if self._override_w is None:
-            self._active_power_w = self._auto_power_w(self._active_session())
+            self._active_power_w = self._auto_power_w(session)
 
         dt_hours = dt_seconds / 3600.0
         requested_w = max(0.0, self._active_power_w)

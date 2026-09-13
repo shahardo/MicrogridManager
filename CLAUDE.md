@@ -76,7 +76,13 @@ single-site controller + simulation.
     target it auto-charges at rated power exactly like the generator's
     internal setpoint, but `set_active_power_w` overrides that decision —
     same override pattern as `load.py` — so M7's dispatcher can shape the
-    charge curve later without this adapter changing), `water_heater.py`
+    charge curve later without this adapter changing. Also tracks the
+    plugged-in → unplugged transition and, if `commute_energy_wh` > 0
+    (default 0, no effect), deducts it from the battery once per trip —
+    without this, a car already at its session's target has nothing left to
+    charge on a later day even if it keeps plugging in on schedule, which is
+    what made the EV panel go flat in any live dashboard session running
+    past the first simulated day), `water_heater.py`
     (`SimulatedWaterHeaterAdapter` — no capability mixins, self-managing: a
     virtual tank depletes against a `WaterDrawProfile` and the heating
     element cycles on/off with hysteresis between `low_fraction`/
@@ -108,6 +114,16 @@ single-site controller + simulation.
     `step_scenario()` returns one flat dict per tick (18 fields — every
     device's power/status plus tariff price) that both `runner.py` (batch)
     and `live_engine.py` (live) feed into the telemetry store unchanged.
+    `_daily_ev_sessions(start)` generates a **recurring daily commute
+    pattern** (plug in every evening, charge overnight, unplug for the
+    morning commute) for a year out, rather than the original one-off list
+    of two sessions — the original list only covered the scenario's first
+    24 hours, which is invisible in a bounded batch `run()` but meant every
+    live dashboard session that ran past its first simulated day saw the EV
+    permanently flat (unplugged, 0 W, constant SoC). Paired with the EV
+    adapter's `commute_energy_wh` (see above) so the car actually needs each
+    night's charge rather than arriving already at target. See
+    `tests/scenarios/test_household_day.py::test_ev_charger_keeps_plugging_in_on_later_days`.
   - `runner.py` — CLI: `--scenario` (`normal_day` or `household_day`),
     `--step-seconds`, `--duration-hours`, `--output`, `--telemetry-db`,
     `--run-id`; writes the scenario's per-step readings to CSV
