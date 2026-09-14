@@ -16,6 +16,13 @@ Both just forward to the engine — the actual protection-gated
 apply-or-reject decision happens in `simulation.scenarios.household_day`,
 not here, so this module's job stays routing HTTP to the engine's small
 interface.
+
+Post-M9 adds the simulation-disturbance endpoints (`POST
+/api/controls/outage`, `POST /api/controls/disturbance/{load,pv,
+demand_response}`) — same pattern, thin forwarding to the engine's
+`trigger_outage`/`set_load_disturbance`/`set_pv_disturbance`/
+`set_demand_response`, with the actual disturbance effect applied in
+`simulation.scenarios.household_day.step_scenario`.
 """
 
 from __future__ import annotations
@@ -56,6 +63,16 @@ class LiveEngine(Protocol):
     def set_ev_override(self, power_w: float | None) -> None: ...
     def set_water_heater_override(self, force_heating: bool | None) -> None: ...
     def device_adapter_modes(self) -> list[dict[str, Any]]: ...
+    def trigger_outage(self, duration_minutes: float | None) -> None: ...
+    def set_load_disturbance(
+        self, multiplier: float | None, duration_minutes: float | None
+    ) -> None: ...
+    def set_pv_disturbance(
+        self, multiplier: float | None, duration_minutes: float | None
+    ) -> None: ...
+    def set_demand_response(
+        self, max_import_w: float | None, duration_minutes: float | None
+    ) -> None: ...
     def tick(self) -> dict: ...
 
 
@@ -79,6 +96,23 @@ class WaterHeaterOverrideRequest(BaseModel):
     hysteresis control."""
 
     force_heating: bool | None = None
+
+
+class OutageRequest(BaseModel):
+    """`duration_minutes=None` (or omitted/non-positive) clears a pending
+    outage and reconnects the grid immediately; otherwise the grid is
+    disconnected for that many minutes and then automatically reconnects."""
+
+    duration_minutes: float | None = None
+
+
+class DisturbanceRequest(BaseModel):
+    """`value=None` clears the disturbance. `duration_minutes=None` (or
+    omitted/non-positive) leaves it active indefinitely, until explicitly
+    cleared."""
+
+    value: float | None = None
+    duration_minutes: float | None = None
 
 
 async def _run_engine_loop(engine: LiveEngine, base_interval_seconds: float) -> None:
@@ -172,6 +206,26 @@ def create_app(
     @app.get("/api/devices")
     def get_devices() -> list[dict]:
         return engine.device_adapter_modes()
+
+    @app.post("/api/controls/outage")
+    def trigger_outage(request: OutageRequest) -> dict:
+        engine.trigger_outage(request.duration_minutes)
+        return {"duration_minutes": request.duration_minutes}
+
+    @app.post("/api/controls/disturbance/load")
+    def set_load_disturbance(request: DisturbanceRequest) -> dict:
+        engine.set_load_disturbance(request.value, request.duration_minutes)
+        return {"multiplier": request.value, "duration_minutes": request.duration_minutes}
+
+    @app.post("/api/controls/disturbance/pv")
+    def set_pv_disturbance(request: DisturbanceRequest) -> dict:
+        engine.set_pv_disturbance(request.value, request.duration_minutes)
+        return {"multiplier": request.value, "duration_minutes": request.duration_minutes}
+
+    @app.post("/api/controls/disturbance/demand_response")
+    def set_demand_response(request: DisturbanceRequest) -> dict:
+        engine.set_demand_response(request.value, request.duration_minutes)
+        return {"max_import_w": request.value, "duration_minutes": request.duration_minutes}
 
     @app.get("/api/runs")
     def list_runs() -> list[str]:

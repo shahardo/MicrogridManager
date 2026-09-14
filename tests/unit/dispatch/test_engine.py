@@ -236,6 +236,47 @@ def test_unreachable_ev_target_is_clamped_instead_of_raising() -> None:
         assert power == pytest.approx(1_000.0)
 
 
+def test_max_import_w_caps_grid_import_across_the_horizon() -> None:
+    """A demand-response import cap (the dashboard's disturbance control)
+    should bind grid_import for every horizon step, shifting the battery to
+    cover the rest of the load instead."""
+    engine = DispatchEngine(step_seconds=STEP_SECONDS, horizon_hours=1.0)
+    battery = BatteryState(state_of_charge=0.8, capacity_wh=10_000.0, rated_power_w=5_000.0)
+    cap_w = 200.0
+
+    plan = engine.dispatch(
+        now=START,
+        pv_actual_w=0.0,
+        load_actual_w=1_500.0,
+        battery=battery,
+        tariff_at=_flat_tariff(0.2, 0.05),
+        max_import_w=[cap_w] * engine.horizon_steps,
+    )
+
+    # With PV=0 and load=1500W under a 200W import cap, the shortfall (at
+    # least ~1300W) must come from the battery discharging.
+    assert plan.battery_setpoint_w >= 1_300.0 - 1e-6
+
+
+def test_unreachable_import_cap_is_clamped_instead_of_raising() -> None:
+    """A demand-response cap tighter than PV + battery's full rated power can
+    ever cover must not make the whole tick's dispatch infeasible — it
+    should fall back to the minimum grid import actually needed."""
+    engine = DispatchEngine(step_seconds=STEP_SECONDS, horizon_hours=1.0)
+    battery = BatteryState(state_of_charge=1.0, capacity_wh=10_000.0, rated_power_w=1_000.0)
+
+    plan = engine.dispatch(
+        now=START,
+        pv_actual_w=0.0,
+        load_actual_w=10_000.0,  # far more than PV + battery's rated power can cover
+        battery=battery,
+        tariff_at=_flat_tariff(0.2, 0.05),
+        max_import_w=[0.0] * engine.horizon_steps,
+    )
+
+    assert plan.battery_power_w[0] == pytest.approx(1_000.0, rel=1e-6)
+
+
 def test_history_grows_and_forecasts_do_not_see_the_current_tick() -> None:
     """No seasonal (24h-cycle) match exists yet at any of these ticks, so
     each call's forecast should fall back to the *previous* tick's actual

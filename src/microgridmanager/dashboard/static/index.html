@@ -87,6 +87,52 @@
     </div>
   </section>
 
+  <section id="disturbances-panel" class="panel">
+    <h2>Simulation disturbances</h2>
+    <p class="hint">
+      Inject environmental/external swings into the running simulation and
+      watch protection/dispatch react — separate from the manual overrides
+      above, which instead dictate a device's setpoint directly.
+    </p>
+    <div class="controls-row">
+      <label>Outage duration (min)
+        <input id="outage-input" type="number" min="1" step="1" placeholder="10" />
+      </label>
+      <button id="outage-trigger">Trigger outage</button>
+      <button id="outage-clear">Reconnect now</button>
+    </div>
+    <div class="controls-row">
+      <label>Household demand multiplier (1.0 = normal)
+        <input id="load-disturbance-input" type="number" step="0.1" min="0" placeholder="1.0" />
+      </label>
+      <label>Duration (min, blank = indefinite)
+        <input id="load-disturbance-duration" type="number" min="1" step="1" />
+      </label>
+      <button id="load-disturbance-set">Set</button>
+      <button id="load-disturbance-clear">Clear</button>
+    </div>
+    <div class="controls-row">
+      <label>PV output multiplier / clouds (1.0 = normal)
+        <input id="pv-disturbance-input" type="number" step="0.1" min="0" placeholder="1.0" />
+      </label>
+      <label>Duration (min, blank = indefinite)
+        <input id="pv-disturbance-duration" type="number" min="1" step="1" />
+      </label>
+      <button id="pv-disturbance-set">Set</button>
+      <button id="pv-disturbance-clear">Clear</button>
+    </div>
+    <div class="controls-row">
+      <label>Demand response grid-import cap (W)
+        <input id="dr-disturbance-input" type="number" step="100" min="0" placeholder="none" />
+      </label>
+      <label>Duration (min, blank = indefinite)
+        <input id="dr-disturbance-duration" type="number" min="1" step="1" />
+      </label>
+      <button id="dr-disturbance-set">Set</button>
+      <button id="dr-disturbance-clear">Clear</button>
+    </div>
+  </section>
+
   <section id="device-adapters-panel" class="panel">
     <h2>Device adapters</h2>
     <p class="hint">

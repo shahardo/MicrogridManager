@@ -38,6 +38,40 @@ safety decisions; it can only act within whatever those decisions already
 allow. Every tick reports whether each override was active and whether it
 was actually applied, so a rejected override is visible rather than silently
 dropped (see the `*_override_*` row fields below).
+
+Post-M9 adds `ScenarioDisturbances`: dashboard controls for injecting
+environmental/external disturbances into a *running* simulation, distinct
+from `ManualOverrides` (which requests a specific device setpoint) — a
+disturbance instead perturbs the scenario's own inputs and lets automatic
+control (protection/dispatch/the fallback rule) react to it, which is the
+point: an operator wants to see how the system *responds* to a cloud front
+or a utility demand-response event, not to dictate the response itself.
+Three disturbances, each `None`/inactive by default:
+
+- `load_multiplier` — scales household demand (e.g. 1.5 for "high demand",
+  0.5 for "low demand") before it ever reaches the protection/shedding
+  calculation, so a scaled-up demand can genuinely trigger shedding under an
+  outage exactly like a real demand swing would.
+- `pv_multiplier` — scales PV output via `SimulatedPVAdapter.
+  set_output_multiplier` (e.g. 0.2 for heavy cloud cover) — the "clouds"
+  control.
+- `max_import_w` — a demand-response cap on grid import, passed straight
+  into `DispatchEngine.dispatch()`'s `max_import_w` parameter so the LP
+  proactively shifts to battery/EV usage around the constrained window
+  instead of a post-hoc clamp. Only takes effect while dispatch is actually
+  running (`dispatch_active`) — while islanded/black-starting there's no
+  grid exchange to cap in the first place, and while `dispatch_enabled=False`
+  there's no LP to hand the constraint to (the naive fallback rule has no
+  notion of a grid cap at all — a documented scope cut, not an oversight).
+
+Each field pairs with a `*_until` expiry (`datetime | None`) so a live
+dashboard control can be "trigger for N minutes" rather than needing a
+separate clear step — `_disturbance_active` below is the one place that
+checks `now` against `until`. Unlike `ManualOverrides`, whose active/applied
+outcome depends on the protection gate, a disturbance is simply active or
+not (protection still runs and may still shed loads in response to it, same
+as it would to any other demand/supply swing) — so the row fields below
+report activity, not an applied/rejected distinction.
 """
 
 from __future__ import annotations
@@ -62,7 +96,12 @@ from microgridmanager.adapters.simulated.profiles import (
     household_water_draw_profile,
     time_of_use_tariff_profile,
 )
-from microgridmanager.dispatch import BatteryState, DispatchEngine, EVChargingState
+from microgridmanager.dispatch import (
+    BatteryState,
+    DispatchEngine,
+    DispatchInfeasibleError,
+    EVChargingState,
+)
 from microgridmanager.protection import (
     PROTECTION_STATE_CODES,
     ProtectionController,
@@ -120,6 +159,28 @@ def _override_allowed(decision: ProtectionDecision, served_key: str | None = Non
     if served_key is not None and not decision.served.get(served_key, True):
         return False
     return True
+
+
+@dataclass(frozen=True)
+class ScenarioDisturbances:
+    """One tick's pending environmental/external disturbances, from the
+    dashboard's controls panel — see the module docstring for how these
+    differ from `ManualOverrides`. Each value pairs with a `*_until`
+    expiry; `None` for a value (regardless of its `*_until`) means "no
+    disturbance, use the scenario's normal input"."""
+
+    load_multiplier: float | None = None
+    load_multiplier_until: datetime | None = None
+    pv_multiplier: float | None = None
+    pv_multiplier_until: datetime | None = None
+    max_import_w: float | None = None
+    max_import_w_until: datetime | None = None
+
+
+def _disturbance_active(value: float | None, until: datetime | None, now: datetime) -> bool:
+    """Whether a `ScenarioDisturbances` field is currently in effect: set,
+    and either open-ended (`until is None`) or not yet expired."""
+    return value is not None and (until is None or now < until)
 
 
 def grid_outage_between(outage_start: datetime, outage_end: datetime) -> Callable[[datetime], bool]:
@@ -282,6 +343,7 @@ def step_scenario(
     grid_connected: bool = True,
     dispatch_enabled: bool = True,
     overrides: ManualOverrides | None = None,
+    disturbances: ScenarioDisturbances | None = None,
 ) -> dict:
     """Advance one control step.
 
@@ -314,10 +376,33 @@ def step_scenario(
     rejects it (`_override_allowed`), rather than needing a separate pass
     that could race this tick's protection decision.
 
+    `disturbances`, if given, perturb the scenario's own inputs (household
+    demand, PV output, a grid-import cap) *before* protection/dispatch ever
+    see them, so automatic control reacts to the disturbance the same way it
+    would to a real one — see `ScenarioDisturbances`' docstring for why this
+    is a different mechanism from `overrides`.
+
     Returns a flat dict of this step's readings, the visible per-tick record
     every later milestone (and the M4 dashboard) reads.
     """
     overrides = overrides or ManualOverrides()
+    disturbances = disturbances or ScenarioDisturbances()
+    now = assets.clock.now
+
+    load_disturbance_active = _disturbance_active(
+        disturbances.load_multiplier, disturbances.load_multiplier_until, now
+    )
+    pv_disturbance_active = _disturbance_active(
+        disturbances.pv_multiplier, disturbances.pv_multiplier_until, now
+    )
+    demand_response_active = _disturbance_active(
+        disturbances.max_import_w, disturbances.max_import_w_until, now
+    )
+    # Always (re)set the multiplier, active or not, so clearing a disturbance
+    # (or letting it expire) restores the profile-driven output exactly —
+    # the adapter itself has no notion of "no disturbance was requested this
+    # tick" to fall back to on its own.
+    assets.pv.set_output_multiplier(disturbances.pv_multiplier if pv_disturbance_active else 1.0)
 
     # Clear any override a previous tick's shed left in place *before*
     # reading demand: household_load's own get_state() reflects the override
@@ -331,6 +416,16 @@ def step_scenario(
 
     pv_state = assets.pv.get_state()
     household_state = assets.household_load.get_state()
+    if load_disturbance_active:
+        # Applied via the load adapter's existing override mechanism (the
+        # same one `overrides` would use for other loads) rather than a new
+        # adapter method — scaling *this tick's* profile-driven demand, so
+        # it tracks the profile's own shape (e.g. still peaks in the
+        # evening) instead of pinning demand to a fixed level.
+        assets.household_load.set_active_power_w(
+            household_state.active_power_w * disturbances.load_multiplier
+        )
+        household_state = assets.household_load.get_state()
     ev_demand_w = assets.ev_charger.get_state().active_power_w
     water_heater_demand_w = assets.water_heater.get_state().active_power_w
 
@@ -406,7 +501,17 @@ def step_scenario(
             capacity_wh=BATTERY_CAPACITY_WH,
             rated_power_w=BATTERY_RATED_POWER_W,
         )
-        plan = assets.dispatch.dispatch(
+        # A flat cap across the whole horizon is a deliberate simplification
+        # — the LP's immediate (index-0) decision is what actually matters
+        # each tick, and treating the cap as constant for planning purposes
+        # only makes the plan slightly more conservative near the window's
+        # edge, never unsafe.
+        max_import_w_horizon = (
+            [disturbances.max_import_w] * assets.dispatch.horizon_steps
+            if demand_response_active
+            else None
+        )
+        dispatch_kwargs = dict(
             now=assets.clock.now,
             pv_actual_w=pv_state.active_power_w,
             load_actual_w=household_state.active_power_w + water_heater_state.active_power_w,
@@ -414,6 +519,21 @@ def step_scenario(
             tariff_at=assets.grid.peek_price,
             ev=ev_dispatch_state,
         )
+        try:
+            plan = assets.dispatch.dispatch(**dispatch_kwargs, max_import_w=max_import_w_horizon)
+        except DispatchInfeasibleError:
+            # `_clamped_import_caps` only accounts for the battery's rated
+            # power, not its remaining energy or the EV's own target-SoC
+            # constraints over the horizon — an aggressive operator-supplied
+            # cap can still combine with those to leave no feasible plan.
+            # Same rationale as the EV target clamp: a demand-response
+            # disturbance must never crash the tick, so fall back to an
+            # uncapped plan rather than propagating the error — the cap
+            # simply couldn't be honored this tick given everything else
+            # going on.
+            if max_import_w_horizon is None:
+                raise
+            plan = assets.dispatch.dispatch(**dispatch_kwargs, max_import_w=None)
         dispatch_projected_cost = plan.projected_cost
 
         if ev_override_applied:
@@ -511,6 +631,16 @@ def step_scenario(
         "water_heater_override_active": float(water_heater_override_active),
         "water_heater_override_heating": float(overrides.water_heater_force_heating or False),
         "water_heater_override_applied": float(water_heater_override_applied),
+        # Simulation disturbances (dashboard controls injecting
+        # environmental/external swings into a running simulation — see
+        # `ScenarioDisturbances`): always present, active or not, so
+        # replay's position-for-position `reconstructRows` stays aligned.
+        "load_disturbance_active": float(load_disturbance_active),
+        "load_disturbance_multiplier": disturbances.load_multiplier or 1.0,
+        "pv_disturbance_active": float(pv_disturbance_active),
+        "pv_disturbance_multiplier": disturbances.pv_multiplier or 1.0,
+        "demand_response_active": float(demand_response_active),
+        "demand_response_cap_w": disturbances.max_import_w or 0.0,
     }
 
 
@@ -522,6 +652,7 @@ def run(
     grid_connected_at: Callable[[datetime], bool] | None = None,
     dispatch_enabled: bool = True,
     overrides: ManualOverrides | None = None,
+    disturbances: ScenarioDisturbances | None = None,
 ) -> list[dict]:
     """Run the scenario. `grid_connected_at`, if given, is evaluated against
     the clock each tick to drive the M5 protection state machine — e.g.
@@ -533,10 +664,11 @@ def run(
     "naive baseline" `simulation/dispatch_report.py` compares the real
     dispatch engine against.
 
-    `overrides` (M9), if given, is applied identically every tick — a batch
-    run has no live operator changing their mind mid-run, so this is mostly
-    useful for scenario tests exercising the override gating without driving
-    `step_scenario` tick-by-tick themselves."""
+    `overrides` (M9)/`disturbances`, if given, are applied identically every
+    tick — a batch run has no live operator changing their mind mid-run, so
+    these are mostly useful for scenario tests exercising the override/
+    disturbance gating without driving `step_scenario` tick-by-tick
+    themselves."""
     assets = build_scenario(start=start, step_seconds=step_seconds)
     num_steps = int(duration_hours * 3600.0 / step_seconds)
     grid_connected_at = grid_connected_at or (lambda _now: True)
@@ -551,6 +683,7 @@ def run(
                 grid_connected=grid_connected,
                 dispatch_enabled=dispatch_enabled,
                 overrides=overrides,
+                disturbances=disturbances,
             )
         )
         assets.clock.tick()

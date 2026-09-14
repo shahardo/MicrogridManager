@@ -33,8 +33,8 @@ implementation roadmap.
 
 ## Status
 
-**Implementation in progress (Phase 1, M9 — dashboard integration & manual
-overrides).** The architecture and Phase 1 plan are defined (see
+**Implementation in progress (Phase 1, post-M9 — simulation disturbance
+controls).** The architecture and Phase 1 plan are defined (see
 `docs/architecture.md` §6 and `docs/phase-1-dev-plan.md`). M1 delivered the
 canonical asset model and `AssetAdapter` interface; M2 added simulated PV,
 battery (BESS), controllable load, and diesel/gas generator adapters plus a
@@ -52,11 +52,17 @@ the dashboard's forecast panel, replacing its original inline placeholder;
 M7 added the real rolling-horizon economic dispatch engine — an LP that
 chooses the battery's and EV charger's schedules to minimize grid cost using
 those forecasts and the real tariff, replacing the original fixed
-self-consumption rule whenever the grid is available; M9 adds manual
+self-consumption rule whenever the grid is available; M9 added manual
 setpoint overrides to the dashboard's controls panel (battery/EV power, a
 water-heater force-on/off), routed through the same M5 protection gate as
 automated control, so an unsafe one is visibly rejected rather than silently
-dropped — see "Manual overrides" below.
+dropped (see "Manual overrides" below). Post-M9 adds a "Simulation
+disturbances" controls-panel section — timed grid outages, a household
+demand multiplier, a PV/"clouds" output multiplier, and a utility
+demand-response grid-import cap — letting an operator perturb a *running*
+live simulation and watch protection/dispatch react to it, distinct from the
+M9 overrides (which instead dictate a device's setpoint directly); see
+"Simulation disturbances" below.
 
 **M8 (real Modbus/SunSpec adapters) was deliberately done *after* M9**,
 reordered from the dev plan's default sequence — M9's override wiring
@@ -224,6 +230,41 @@ The "Device adapters" panel below it lists every device's current adapter
 mode — `simulated` for all of them today, since M8's real Modbus/SunSpec
 adapters haven't landed yet; the panel (and its backing `GET /api/devices`
 endpoint) is the seam M8 will register a real option into.
+
+## Simulation disturbances
+
+The dashboard's "Simulation disturbances" controls-panel section (below
+"Manual overrides") lets you inject environmental/external swings into a
+*running* live simulation and watch automated control react to them — a
+different thing from an override, which instead dictates a device's
+setpoint directly:
+
+- **Outage** — trigger a timed grid disconnect (auto-reconnects after the
+  given number of minutes), a convenience over the same grid connect/
+  disconnect toggle M5 already drives.
+- **Household demand multiplier** — scale household load up (e.g. `1.5` for
+  "high demand") or down (e.g. `0.5` for "low demand"), relative to its
+  normal profile-driven value, for a given duration or indefinitely.
+- **PV output multiplier ("clouds")** — scale rooftop PV output (e.g. `0.2`
+  for heavy cloud cover), for a given duration or indefinitely.
+- **Demand response grid-import cap** — cap how much power may be imported
+  from the grid (a simulated utility demand-response event). This one is
+  handed straight to the M7 dispatch engine's LP as a constraint, so it
+  proactively shifts to the battery/EV instead of a post-hoc clamp — it only
+  has an effect while dispatch is actually running (grid-connected, not
+  islanded/black-starting).
+
+Each disturbance (other than the outage) pairs with a duration in minutes —
+leave it blank for an indefinite disturbance, or use each control's "Clear"
+button to cancel it immediately. The "Simulation disturbances" decision card
+shows each one's current status (`inactive` or its active value) live, and
+new `*_disturbance_active`/`*_multiplier`/`demand_response_cap_w` fields are
+recorded to telemetry alongside everything else, so a disturbance shows up
+in replay exactly like it did live.
+
+(No wind-generation disturbance is offered — this scenario has no wind
+asset, only rooftop PV, so a "clouds" PV multiplier is the only weather-like
+control that applies.)
 
 ## Forecasting
 

@@ -12,7 +12,8 @@ hardware control and simulation behind one control interface, and assumes
 multi-tenant ownership with intermittent connectivity between tiers.
 
 Current status: Phase 1 implementation, M9 (dashboard integration & manual
-overrides) complete; following the phased roadmap in `docs/architecture.md`
+overrides) complete, plus a post-M9 "simulation disturbance controls"
+addition (see below); following the phased roadmap in `docs/architecture.md`
 §6 and `docs/phase-1-dev-plan.md`, starting with a single-site controller +
 simulation. **M8 (real Modbus/SunSpec adapters) was deliberately deferred**
 and done *after* M9, not before it as the dev plan orders them — M9's
@@ -23,6 +24,20 @@ below): the selector reports every device as `"simulated"`-only rather than
 offering a real option that doesn't work yet. M8, whenever it lands, should
 register a real adapter mode there rather than reopening this file's other
 M9 changes.
+
+**Post-M9: simulation disturbance controls.** Not a numbered milestone in
+the dev plan — an ad hoc addition on top of M9's dashboard, adding a second
+controls-panel mechanism (`ScenarioDisturbances`, alongside M9's
+`ManualOverrides`) that perturbs the *scenario's own inputs* (household
+demand, PV output, a grid-import cap) rather than a device's setpoint, so an
+operator can watch protection/dispatch *react* to an outage, a demand swing,
+cloud cover, or a utility demand-response event instead of dictating the
+response directly. Deliberately does **not** include any wind-generation
+control — this scenario has no wind turbine asset, only rooftop PV, and a
+user request for one was explicitly declined in favor of dropping it
+entirely rather than folding it into the PV/"clouds" control. See the
+`household_day.py`, `live_engine.py`, and dashboard entries below for what
+changed.
 
 ## Working conventions (always follow these)
 
@@ -64,7 +79,8 @@ M9 changes.
   - `adapters/simulated/` — **M2 simulated adapters**, all driven off one
     shared `SimulationClock` (`clock.py`, discrete time-step, `now`/`tick()`):
     `pv.py` (irradiance-profile driven, not user-settable — no curtailment
-    yet), `battery.py` (`PowerControllable` + `StateOfChargeReadable`;
+    yet — see the post-M9 `set_output_multiplier` addition below), `battery.py`
+    (`PowerControllable` + `StateOfChargeReadable`;
     `set_active_power_w` records the setpoint immediately, `step(dt_seconds)`
     integrates state of charge with round-trip efficiency and clamps applied
     power to rated power / available energy), `load.py` (profile-driven,
@@ -113,6 +129,15 @@ M9 changes.
     always wins over it inside `step()`; the calling scenario is
     responsible for only invoking the manual override when its own gating
     says that's safe (see `household_day._override_allowed` below).
+  - `pv.py` also gained `set_output_multiplier(multiplier: float)`
+    (post-M9): scales output relative to the irradiance profile's own curve
+    (`1.0` = no effect), clamped to `[0.0, rated_power_w]` in `get_state()`.
+    This is the dashboard's "clouds" disturbance control (e.g. `0.3` for
+    heavy cloud cover) — deliberately *not* a `PowerControllable`
+    curtailment mixin: it's a continuous scale on the profile-driven curve
+    (and, unlike curtailment, can raise output above the curve too, not
+    just cap it below), applied by `household_day.step_scenario` every tick
+    from `ScenarioDisturbances.pv_multiplier` (see below).
 - `src/microgridmanager/protection/state_machine.py` — **the M5 protection &
   control state machine**: `ProtectionState` (`NORMAL` ↔
   `ISLANDING_TRANSITION` ↔ `ISLANDED` ↔ `BLACK_START` ↔ `RESTORATION`,
@@ -210,6 +235,23 @@ M9 changes.
     so an over-ambitious target still gets the best charge possible instead
     of failing the tick — see
     `tests/unit/dispatch/test_engine.py::test_unreachable_ev_target_is_clamped_instead_of_raising`.
+  - **Post-M9: `max_import_w`** — an optional per-horizon-step cap on
+    `dispatch()`'s grid-import variable, for the dashboard's demand-response
+    disturbance control. Enforced as a tighter `upBound` on `grid_import[k]`
+    (not a post-hoc clamp on the result) so the LP proactively shifts to
+    battery/EV usage around the constrained window — the same "sees it
+    coming" behavior M7's terminal-value fix already relies on.
+    `_clamped_import_caps` floors an unreachably-low cap at the minimum
+    import each step's forecasted load actually needs (`load - pv -
+    battery.rated_power_w`), mirroring `_clamped_ev_targets`'s rationale —
+    but unlike the EV clamp, this one **doesn't** account for the battery's
+    remaining energy or the EV's own target-SoC constraints over the
+    horizon, so an aggressive cap can still combine with those to leave the
+    LP infeasible; `household_day.step_scenario`'s dispatch branch is what
+    actually guarantees the tick never crashes (see below), catching
+    `DispatchInfeasibleError` and retrying uncapped. See
+    `tests/unit/dispatch/test_engine.py::test_max_import_w_caps_grid_import_across_the_horizon`
+    and `::test_unreachable_import_cap_is_clamped_instead_of_raising`.
 
   `EVChargingState` is dispatch's own generic shape for "which horizon steps
   is a controllable EV plugged in, and what SoC must it reach by when" —
@@ -339,6 +381,44 @@ M9 changes.
       rather than a silently dropped one. See
       `tests/scenarios/test_household_day.py::test_manual_overrides_are_applied_while_grid_connected`
       and `::test_manual_overrides_are_rejected_while_islanded`.
+    - **Post-M9**: adds `ScenarioDisturbances` (`load_multiplier`,
+      `pv_multiplier`, `max_import_w`, each paired with a `*_until` expiry)
+      and `_disturbance_active(value, until, now)`. Distinct from
+      `ManualOverrides` — a disturbance perturbs the scenario's own *inputs*
+      rather than requesting a device setpoint, so automated control reacts
+      to it (the point of the feature) instead of being bypassed. Applied at
+      the top of `step_scenario`, before protection/dispatch ever see the
+      affected values: `load_multiplier` scales `household_load`'s demand
+      via its existing override mechanism (`set_active_power_w`, same one
+      `overrides` uses) *before* the `SheddableLoad` list is built, so a
+      scaled-up demand can genuinely trigger shedding; `pv_multiplier` is
+      forwarded every tick to `SimulatedPVAdapter.set_output_multiplier`
+      (always — active or not — so clearing/expiring restores `1.0` rather
+      than leaving a stale multiplier the adapter has no way to know is
+      gone); `max_import_w`, while dispatch is active, becomes a flat
+      per-horizon-step cap passed to `DispatchEngine.dispatch()`'s
+      `max_import_w` parameter (a deliberate simplification — only the
+      immediate index-0 decision actually matters each tick) — wrapped in a
+      `try`/`except DispatchInfeasibleError` that retries uncapped, since
+      `_clamped_import_caps` alone can't rule out every way an aggressive
+      cap combines with the battery's energy state or the EV's target-SoC
+      constraints to leave no feasible plan (see the dispatch/engine.py
+      entry above), and a disturbance must never crash the tick. New row
+      fields (always present): `load_disturbance_active`/
+      `load_disturbance_multiplier`, `pv_disturbance_active`/
+      `pv_disturbance_multiplier`, `demand_response_active`/
+      `demand_response_cap_w` — unlike `ManualOverrides`' `*_applied`
+      fields, there's no applied-vs-rejected distinction here (protection
+      still runs and may still shed loads in response, exactly like it
+      would to any other real swing), so these just report whether the
+      disturbance was requested and not yet expired. See
+      `tests/scenarios/test_household_day.py::test_load_disturbance_scales_household_demand`,
+      `::test_pv_disturbance_scales_pv_output`,
+      `::test_disturbance_expires_after_its_duration`,
+      `::test_demand_response_caps_grid_import`,
+      `::test_demand_response_has_no_effect_while_islanded`, and
+      `::test_demand_response_cap_never_crashes_dispatch_over_many_ticks`
+      (the regression test for the infeasibility case above).
   - `runner.py` — CLI: `--scenario` (`normal_day` or `household_day`),
     `--step-seconds`, `--duration-hours`, `--output`, `--telemetry-db`,
     `--run-id`, and (household_day only, M5) `--outage-start-hour`/
@@ -392,7 +472,21 @@ M9 changes.
     decision lives entirely in `household_day._override_allowed`, not here)
     and `device_adapter_modes()` (returns every device as `"simulated"`-only
     — see the "Current status" note at the top of this file for why the
-    real option isn't backed yet).
+    real option isn't backed yet). **Post-M9** adds the mirrored disturbance
+    setters — `set_load_disturbance`/`set_pv_disturbance`/
+    `set_demand_response(value, duration_minutes)`, each stashing a value +
+    computed `*_until` expiry on `self._disturbances`, a
+    `household_day.ScenarioDisturbances`, which `tick()` now also passes
+    into `step_scenario` — and `trigger_outage(duration_minutes)`, which is
+    the one disturbance that does *not* go through `ScenarioDisturbances`:
+    it just reuses the existing `grid_connected` toggle and tracks its own
+    expiry (`self._outage_until`), checked at the top of every `tick()`, so
+    the grid reconnects automatically without introducing a third
+    outage-scripting mechanism alongside `grid_connected_at`/
+    `grid_outage_between` (both batch-only). Adds one dashboard-only row
+    field, `outage_disturbance_active`, distinguishing a timed outage from
+    the plain manual toggle staying off indefinitely (both already show up
+    in `grid_connected`).
   - `dashboard_runner.py` — CLI (`python -m simulation.dashboard_runner`,
     `make run-dashboard`) wiring a `TelemetryStore` + `SimulationEngine` into
     `microgridmanager.dashboard.app.create_app()` and serving it with
@@ -482,6 +576,26 @@ M9 changes.
   see the "Current status" note at the top of this file). Also fixes the
   forecast chart's heading, which still said "placeholder persistence model,
   M6 replaces this" after M6 had already replaced it.
+
+  **Post-M9** adds `POST /api/controls/outage` (body `{duration_minutes}`;
+  `null`/omitted/non-positive clears a pending outage and reconnects
+  immediately) and `POST /api/controls/disturbance/{load,pv,demand_response}`
+  (body `{value, duration_minutes}`; `value=null` clears it, `duration_minutes
+  =null`/omitted leaves it active indefinitely) — same thin-forwarding
+  pattern as M9's override endpoints, extending the `LiveEngine` protocol
+  with `trigger_outage`/`set_load_disturbance`/`set_pv_disturbance`/
+  `set_demand_response`. Visible result: `static/index.html`/`app.js` add a
+  "Simulation disturbances" controls-panel section (below "Manual
+  overrides") — an outage-duration input + Trigger/Reconnect-now, and a
+  multiplier/cap + duration input + Set/Clear row for each of household
+  demand, PV/"clouds", and the demand-response cap — and a matching
+  "Simulation disturbances" decision card (`describeDisturbance` in
+  `app.js`, the disturbance-side counterpart to M9's `describeOverride`,
+  simpler since there's no applied-vs-rejected distinction here) reading the
+  new `*_disturbance_active`/`*_multiplier`/`demand_response_cap_w` row
+  fields. See
+  `tests/unit/dashboard/test_app.py::test_outage_control_disconnects_and_auto_reconnects`
+  and the `test_*_disturbance_control_*` tests alongside it.
 - `scripts/query_telemetry.py` — **M3's visible result**: CLI over the
   telemetry store. No `--run-id` lists runs; `--run-id` alone lists that
   run's series; `--run-id` + `--series` (optionally + `--asset-id`) prints
@@ -508,7 +622,9 @@ M9 changes.
     hysteresis, and M9's `set_manual_heating_override()` forcing it on/off
     against hysteresis, `set_shed` winning over an active override, and
     clearing an override resuming hysteresis — grid cumulative import/export
-    energy and tariff timing).
+    energy and tariff timing). `test_pv.py` also covers the post-M9
+    `set_output_multiplier()` (scales output, clamps to rated power, and
+    clearing it back to `1.0` restores the profile-driven curve exactly).
   - `tests/unit/protection/test_state_machine.py` — **M5's** direct unit
     tests for `ProtectionController`: every transition's guard condition
     (including same-tick grid recovery during `ISLANDING_TRANSITION`, the
@@ -529,28 +645,42 @@ M9 changes.
     the M7 dispatch exit-criteria tests, and the M9 manual-override
     exit-criteria tests (applied while grid-connected; visibly rejected —
     active but not applied — for every tick of a scripted outage, back to
-    applied once `NORMAL` resumes) (see the `household_day.py` entry above).
-    Every M2/M4/M5/M9 test here passes `dispatch_enabled=False` and the
-    M7-specific tests use a coarser step — see this file's own module
-    docstring and the "M7 test performance" note under `dispatch/engine.py`
-    above before adding a new scenario test.
+    applied once `NORMAL` resumes) (see the `household_day.py` entry above),
+    plus the post-M9 disturbance tests (load/PV multipliers scale demand/PV
+    relative to the same tick with no disturbance, a `*_until` expiry
+    actually expires, a demand-response cap binds grid import while dispatch
+    runs and is inert-but-still-reported-active while islanded, and the
+    infeasibility-fallback regression test that ticks 60 times with an
+    aggressive, indefinite import cap active to prove `step_scenario` never
+    lets `DispatchInfeasibleError` propagate).
+    Every M2/M4/M5/M9/post-M9 test here passes `dispatch_enabled=False`
+    unless it specifically needs dispatch, and the M7-specific tests use a
+    coarser step — see this file's own module docstring and the "M7 test
+    performance" note under `dispatch/engine.py` above before adding a new
+    scenario test.
   - `tests/unit/dispatch/test_engine.py` — **M7's** direct unit tests for
     `DispatchEngine`/`_solve`: plan shape, every physical bound (rated
     power, SoC), the terminal-value fix (charges from surplus even on a
     flat tariff, prefers discharging into a visible price spike over an
     equally-flat cheap period), the EV target-SoC-by-deadline constraint,
-    plugged-in-window bounds, the target-clamping fix, and that forecasts
-    never see the current tick's own actual — all with no scenario/adapter
-    involved, so they stay fast regardless of how expensive a full scenario
-    run with dispatch enabled is.
+    plugged-in-window bounds, the target-clamping fix, that forecasts
+    never see the current tick's own actual, and (post-M9) the
+    `max_import_w` demand-response cap binding grid import across the
+    horizon and its own clamping fix for an unreachably-low cap — all with
+    no scenario/adapter involved, so they stay fast regardless of how
+    expensive a full scenario run with dispatch enabled is.
   - `tests/unit/dashboard/` — `test_app.py` drives the FastAPI app's API
     (state/history/controls/runs/series) via `TestClient`, ticking the engine
     manually rather than relying on the real-time background loop so tests
     stay deterministic — including M9's override endpoints (each control
     updates the engine and the next tick's row reflects it, including a
     grid-disconnected case proving an override is actually rejected by the
-    protection gate, not just accepted by the API layer) and `/api/devices`;
-    `test_replay.py` is the M4 replay exit-criteria test — it ticks a
+    protection gate, not just accepted by the API layer), `/api/devices`,
+    and the post-M9 disturbance endpoints (outage trigger + auto-reconnect
+    across multiple manual ticks, and each of the load/PV/demand-response
+    disturbance endpoints updating the engine and showing up in the next
+    tick's row); `test_replay.py` is the M4 replay exit-criteria test — it
+    ticks a
     `SimulationEngine` directly, captures the exact rows returned, then
     asserts `GET /api/runs/{run_id}/data` reconstructs those same rows
     value-for-value and timestamp-for-timestamp.

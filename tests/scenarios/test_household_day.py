@@ -334,6 +334,115 @@ def test_manual_overrides_are_rejected_while_islanded() -> None:
         assert row["water_heater_heating"] == 1.0
 
 
+def test_load_disturbance_scales_household_demand() -> None:
+    """A load-multiplier disturbance should scale household demand relative
+    to what the same tick would draw with no disturbance active."""
+    assets = household_day.build_scenario(step_seconds=300.0)
+    baseline_row = household_day.step_scenario(assets, 300.0, dispatch_enabled=False)
+
+    assets = household_day.build_scenario(step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(load_multiplier=2.0)
+    row = household_day.step_scenario(
+        assets, 300.0, dispatch_enabled=False, disturbances=disturbances
+    )
+
+    assert row["load_disturbance_active"] == 1.0
+    assert row["load_disturbance_multiplier"] == pytest.approx(2.0)
+    assert row["household_load_power_w"] == pytest.approx(
+        baseline_row["household_load_power_w"] * 2.0, rel=1e-3
+    )
+
+
+def test_pv_disturbance_scales_pv_output() -> None:
+    """A pv-multiplier disturbance ("clouds") should scale PV output
+    relative to the same tick with no disturbance active."""
+    start = household_day.DEFAULT_START + timedelta(hours=12)  # midday, PV actually producing
+    assets = household_day.build_scenario(start=start, step_seconds=300.0)
+    baseline_row = household_day.step_scenario(assets, 300.0, dispatch_enabled=False)
+    assert baseline_row["pv_power_w"] > 0.0
+
+    assets = household_day.build_scenario(start=start, step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(pv_multiplier=0.3)
+    row = household_day.step_scenario(
+        assets, 300.0, dispatch_enabled=False, disturbances=disturbances
+    )
+
+    assert row["pv_disturbance_active"] == 1.0
+    assert row["pv_disturbance_multiplier"] == pytest.approx(0.3)
+    assert row["pv_power_w"] == pytest.approx(baseline_row["pv_power_w"] * 0.3, rel=1e-3)
+
+
+def test_disturbance_expires_after_its_duration() -> None:
+    """A disturbance with a `*_until` in the past should no longer be
+    active/applied, restoring normal behavior automatically."""
+    start = household_day.DEFAULT_START + timedelta(hours=12)
+    assets = household_day.build_scenario(start=start, step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(
+        pv_multiplier=0.1, pv_multiplier_until=start  # already expired at tick time
+    )
+
+    row = household_day.step_scenario(
+        assets, 300.0, dispatch_enabled=False, disturbances=disturbances
+    )
+
+    assert row["pv_disturbance_active"] == 0.0
+    assert row["pv_power_w"] > 0.0  # normal midday output, not scaled down
+
+
+def test_demand_response_caps_grid_import() -> None:
+    """A demand-response disturbance should cap grid import while dispatch is
+    active, with the battery covering the rest of the shortfall instead."""
+    start = household_day.DEFAULT_START  # midnight: no PV, so import is otherwise needed
+    assets = household_day.build_scenario(start=start, step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(max_import_w=100.0)
+
+    row = household_day.step_scenario(
+        assets, 300.0, dispatch_enabled=True, disturbances=disturbances
+    )
+
+    assert row["dispatch_active"] == 1.0
+    assert row["demand_response_active"] == 1.0
+    assert row["demand_response_cap_w"] == pytest.approx(100.0)
+    assert row["grid_power_w"] <= 100.0 + 1e-3
+
+
+def test_demand_response_has_no_effect_while_islanded() -> None:
+    """A demand-response cap only constrains dispatch's LP — while islanded
+    there's no grid exchange for it to cap in the first place, so it's
+    reported as requested (`demand_response_active`) but has no bearing on
+    the (forced-zero) grid power."""
+    assets = household_day.build_scenario(step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(max_import_w=100.0)
+
+    row = household_day.step_scenario(
+        assets, 300.0, grid_connected=False, dispatch_enabled=True, disturbances=disturbances
+    )
+
+    assert row["dispatch_active"] == 0.0
+    assert row["demand_response_active"] == 1.0
+    assert row["grid_power_w"] == 0.0
+
+
+def test_demand_response_cap_never_crashes_dispatch_over_many_ticks() -> None:
+    """Regression test: an aggressive, indefinitely-active demand-response
+    cap combined with the EV's own overnight charging deadline can leave the
+    LP no feasible plan for some tick even after `_clamped_import_caps`'
+    battery-rated-power-only clamp (it doesn't account for the battery's
+    remaining energy or the EV's target-SoC constraints) — `step_scenario`
+    must fall back to an uncapped dispatch rather than let
+    `DispatchInfeasibleError` propagate and crash the tick."""
+    assets = household_day.build_scenario(step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(max_import_w=300.0)
+
+    for _ in range(60):
+        row = household_day.step_scenario(
+            assets, 300.0, dispatch_enabled=True, disturbances=disturbances
+        )
+        assets.clock.tick()
+
+    assert row["timestamp"]  # reached the last tick without raising
+
+
 def test_write_csv_produces_a_readable_file_with_all_rows(tmp_path: Path) -> None:
     rows = household_day.run(step_seconds=1800.0, duration_hours=6.0, dispatch_enabled=False)
     output_path = tmp_path / "household_day.csv"

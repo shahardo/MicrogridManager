@@ -62,6 +62,14 @@ function describeOverride(active, applied, valueLabel) {
   return applied ? `${valueLabel} (applied)` : `${valueLabel} (REJECTED by protection gate)`;
 }
 
+// Describe one disturbance's status from its row's "*_active"/"*_multiplier"
+// (or "*_cap_w") fields — disturbances don't have an applied-vs-rejected
+// distinction like ManualOverrides (protection still reacts to them
+// normally), so this is just "inactive" vs. its current value.
+function describeDisturbance(active, valueLabel) {
+  return active ? valueLabel : "inactive";
+}
+
 function renderCards(row) {
   const deviceCards = document.getElementById("device-cards");
   const decisionCards = document.getElementById("decision-cards");
@@ -153,6 +161,30 @@ function renderCards(row) {
           row.water_heater_override_applied,
           row.water_heater_override_heating ? "force on" : "force off",
         ),
+      ],
+    ]),
+    card("Simulation disturbances", [
+      [
+        "Outage",
+        describeDisturbance(row.outage_disturbance_active, "active (timed)"),
+      ],
+      [
+        "Household demand",
+        describeDisturbance(
+          row.load_disturbance_active,
+          `${row.load_disturbance_multiplier?.toFixed(2)}x`,
+        ),
+      ],
+      [
+        "PV / clouds",
+        describeDisturbance(
+          row.pv_disturbance_active,
+          `${row.pv_disturbance_multiplier?.toFixed(2)}x`,
+        ),
+      ],
+      [
+        "Demand response cap",
+        describeDisturbance(row.demand_response_active, fmtW(row.demand_response_cap_w)),
       ],
     ]),
   ].join("");
@@ -451,11 +483,18 @@ document.getElementById("btn-pause").addEventListener("click", () =>
 );
 document.getElementById("btn-reset").addEventListener("click", () => {
   fetchJSON("/api/controls/reset", { method: "POST" });
-  // Reset clears the engine's overrides too (fresh run) — clear the input
-  // controls to match rather than leaving stale values displayed.
+  // Reset clears the engine's overrides/disturbances too (fresh run) — clear
+  // the input controls to match rather than leaving stale values displayed.
   document.getElementById("battery-override-input").value = "";
   document.getElementById("ev-override-input").value = "";
   document.getElementById("water-heater-override-select").value = "auto";
+  document.getElementById("outage-input").value = "";
+  document.getElementById("load-disturbance-input").value = "";
+  document.getElementById("load-disturbance-duration").value = "";
+  document.getElementById("pv-disturbance-input").value = "";
+  document.getElementById("pv-disturbance-duration").value = "";
+  document.getElementById("dr-disturbance-input").value = "";
+  document.getElementById("dr-disturbance-duration").value = "";
 });
 document.getElementById("speed-input").addEventListener("change", (e) => {
   fetchJSON("/api/controls/speed", {
@@ -505,6 +544,65 @@ document.getElementById("ev-override-clear").addEventListener("click", () => {
 document.getElementById("water-heater-override-select").addEventListener("change", (e) => {
   const forceHeating = { auto: null, on: true, off: false }[e.target.value];
   postOverride("/api/controls/override/water_heater", { force_heating: forceHeating });
+});
+
+function parseDurationMinutes(inputId) {
+  const raw = document.getElementById(inputId).value;
+  if (raw === "") return null;
+  const parsed = parseFloat(raw);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+document.getElementById("outage-trigger").addEventListener("click", () => {
+  const input = document.getElementById("outage-input");
+  const duration_minutes = parseFloat(input.value) || 10.0;
+  postOverride("/api/controls/outage", { duration_minutes });
+});
+document.getElementById("outage-clear").addEventListener("click", () => {
+  document.getElementById("outage-input").value = "";
+  postOverride("/api/controls/outage", { duration_minutes: null });
+});
+
+document.getElementById("load-disturbance-set").addEventListener("click", () => {
+  const value = parseFloat(document.getElementById("load-disturbance-input").value);
+  if (Number.isNaN(value)) return;
+  postOverride("/api/controls/disturbance/load", {
+    value,
+    duration_minutes: parseDurationMinutes("load-disturbance-duration"),
+  });
+});
+document.getElementById("load-disturbance-clear").addEventListener("click", () => {
+  document.getElementById("load-disturbance-input").value = "";
+  document.getElementById("load-disturbance-duration").value = "";
+  postOverride("/api/controls/disturbance/load", { value: null });
+});
+
+document.getElementById("pv-disturbance-set").addEventListener("click", () => {
+  const value = parseFloat(document.getElementById("pv-disturbance-input").value);
+  if (Number.isNaN(value)) return;
+  postOverride("/api/controls/disturbance/pv", {
+    value,
+    duration_minutes: parseDurationMinutes("pv-disturbance-duration"),
+  });
+});
+document.getElementById("pv-disturbance-clear").addEventListener("click", () => {
+  document.getElementById("pv-disturbance-input").value = "";
+  document.getElementById("pv-disturbance-duration").value = "";
+  postOverride("/api/controls/disturbance/pv", { value: null });
+});
+
+document.getElementById("dr-disturbance-set").addEventListener("click", () => {
+  const value = parseFloat(document.getElementById("dr-disturbance-input").value);
+  if (Number.isNaN(value)) return;
+  postOverride("/api/controls/disturbance/demand_response", {
+    value,
+    duration_minutes: parseDurationMinutes("dr-disturbance-duration"),
+  });
+});
+document.getElementById("dr-disturbance-clear").addEventListener("click", () => {
+  document.getElementById("dr-disturbance-input").value = "";
+  document.getElementById("dr-disturbance-duration").value = "";
+  postOverride("/api/controls/disturbance/demand_response", { value: null });
 });
 
 document.getElementById("replay-run-select").addEventListener("change", (e) => loadRun(e.target.value));

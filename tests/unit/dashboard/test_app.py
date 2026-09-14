@@ -200,6 +200,79 @@ def test_devices_endpoint_reports_simulated_only_adapters(engine_and_store) -> N
         assert d["available_modes"] == ["simulated"]
 
 
+def test_outage_control_disconnects_and_auto_reconnects(engine_and_store) -> None:
+    engine, store = engine_and_store
+    app = create_app(engine, store, tick_interval_seconds=NO_BACKGROUND_TICKS)
+
+    with TestClient(app) as client:
+        body = client.post("/api/controls/outage", json={"duration_minutes": 10.0}).json()
+        assert body["duration_minutes"] == 10.0
+        assert engine.grid_connected is False
+
+        row = engine.tick()  # tick at t=0: still within the outage window
+        assert row["outage_disturbance_active"] == 1.0
+        assert engine.grid_connected is False
+
+        row = engine.tick()  # tick at t=+5min: still within the outage window
+        assert row["outage_disturbance_active"] == 1.0
+        assert engine.grid_connected is False
+
+        row = engine.tick()  # tick at t=+10min: the outage has now expired
+        assert row["outage_disturbance_active"] == 0.0
+        assert engine.grid_connected is True
+
+
+def test_load_disturbance_control_scales_household_demand(engine_and_store) -> None:
+    engine, store = engine_and_store
+    app = create_app(engine, store, tick_interval_seconds=NO_BACKGROUND_TICKS)
+    engine.tick()
+
+    with TestClient(app) as client:
+        body = client.post(
+            "/api/controls/disturbance/load", json={"value": 2.0, "duration_minutes": None}
+        ).json()
+        assert body["multiplier"] == 2.0
+
+        row = engine.tick()
+        assert row["load_disturbance_active"] == 1.0
+        assert row["household_load_power_w"] > 0.0
+
+        client.post("/api/controls/disturbance/load", json={"value": None})
+        row = engine.tick()
+        assert row["load_disturbance_active"] == 0.0
+
+
+def test_pv_disturbance_control_scales_pv_output(engine_and_store) -> None:
+    engine, store = engine_and_store
+    app = create_app(engine, store, tick_interval_seconds=NO_BACKGROUND_TICKS)
+
+    with TestClient(app) as client:
+        body = client.post(
+            "/api/controls/disturbance/pv", json={"value": 0.25, "duration_minutes": None}
+        ).json()
+        assert body["multiplier"] == 0.25
+
+        row = engine.tick()
+        assert row["pv_disturbance_active"] == 1.0
+        assert row["pv_disturbance_multiplier"] == pytest.approx(0.25)
+
+
+def test_demand_response_control_caps_grid_import(engine_and_store) -> None:
+    engine, store = engine_and_store
+    app = create_app(engine, store, tick_interval_seconds=NO_BACKGROUND_TICKS)
+
+    with TestClient(app) as client:
+        body = client.post(
+            "/api/controls/disturbance/demand_response",
+            json={"value": 100.0, "duration_minutes": None},
+        ).json()
+        assert body["max_import_w"] == 100.0
+
+        row = engine.tick()
+        assert row["demand_response_active"] == 1.0
+        assert row["demand_response_cap_w"] == pytest.approx(100.0)
+
+
 def test_index_page_is_served(engine_and_store) -> None:
     engine, store = engine_and_store
     app = create_app(engine, store, tick_interval_seconds=NO_BACKGROUND_TICKS)
