@@ -33,9 +33,9 @@ implementation roadmap.
 
 ## Status
 
-**Implementation in progress (Phase 1, M6 — forecasting).** The architecture
-and Phase 1 plan are defined (see `docs/architecture.md` §6 and
-`docs/phase-1-dev-plan.md`). M1 delivered the canonical asset model and
+**Implementation in progress (Phase 1, M7 — optimization/dispatch engine).**
+The architecture and Phase 1 plan are defined (see `docs/architecture.md` §6
+and `docs/phase-1-dev-plan.md`). M1 delivered the canonical asset model and
 `AssetAdapter` interface; M2 added simulated PV, battery (BESS), controllable
 load, and diesel/gas generator adapters plus a shared discrete-time
 simulation clock, and a scripted "normal day" scenario that exercises them
@@ -45,10 +45,14 @@ three more simulated devices, a six-device "household day" scenario combining
 all of them, and a live/replay web dashboard; M5 added the safety-critical
 protection state machine — islanding detection, black start, and
 priority-ordered load shedding — in front of it all, driven either by the
-dashboard's grid connect/disconnect toggle or a scripted outage; M6 adds a
+dashboard's grid connect/disconnect toggle or a scripted outage; M6 added a
 real forecasting module (a `Forecaster` interface plus persistence and
 same-time-of-day-average baseline models) that now drives the dashboard's
-forecast panel, replacing its original inline placeholder.
+forecast panel, replacing its original inline placeholder; M7 adds the real
+rolling-horizon economic dispatch engine — an LP that chooses the battery's
+and EV charger's schedules to minimize grid cost using those forecasts and
+the real tariff, replacing the original fixed self-consumption rule whenever
+the grid is available.
 
 ## Development setup
 
@@ -93,19 +97,21 @@ scenarios are available (`--scenario`, default `normal_day`):
   a backup generator, using a fixed self-consumption control rule (charge the
   battery from excess solar, discharge to cover shortfalls, fall back to the
   generator only if the battery can't keep up).
-- **`household_day`** (M4/M5) — the same PV/battery/household load, plus an
-  EV charger (plugs in every evening for the night, auto-charges toward a
-  target state of charge by the morning, and uses a commute's worth of
-  energy each day it's away — so it keeps needing a real charge indefinitely,
-  not just on the scenario's first day), a water heater (a virtual tank that
-  depletes against a morning/evening hot-water draw and cycles its heating
-  element to reheat), and a grid connection with a time-of-use tariff,
-  absorbing whatever import/export is left over after the battery — unless
-  the M5 protection layer has decided the grid is unavailable, in which case
-  nothing crosses the connection at all (see below).
+- **`household_day`** (M4/M5/M7) — the same PV/battery/household load, plus
+  an EV charger (plugs in every evening for the night and uses a commute's
+  worth of energy each day it's away — so it keeps needing a real charge
+  indefinitely, not just on the scenario's first day), a water heater (a
+  virtual tank that depletes against a morning/evening hot-water draw and
+  cycles its heating element to reheat), and a grid connection with a
+  time-of-use tariff. Whenever the grid is available, the battery's and EV's
+  charging schedules come from the real M7 dispatch engine (see "Dispatch"
+  below) instead of a fixed rule; whenever the M5 protection layer has
+  decided the grid is unavailable, both fall back to a simple
+  resilience-first self-consumption rule and nothing crosses the grid
+  connection at all (see below).
 
-Neither runs the real dispatch engine (that lands in M7) — they exist purely
-to produce visible, inspectable output from the simulated physics.
+`normal_day` doesn't run the real dispatch engine — it exists purely to
+produce visible, inspectable output from the M2 adapters.
 
 ```bash
 make run-scenario                                    # normal_day (default)
@@ -172,13 +178,12 @@ e.g. `uv run python scripts/query_telemetry.py --run-id <run> --series pv_power_
   `make run-scenario` or a previous live session) and lets you play/pause/
   seek/speed through it using the same device cards and charts.
 
-The forecast panel is now backed by the real M6 forecasting module (see
-"Forecasting" below) — no more placeholder. The "decision variables" panel's
-battery/tariff cards (battery SoC headroom, the self-consumption rule's
-output) still ship with small inline placeholders standing in for the real
-dispatch (M7) engine, which doesn't exist yet — that milestone swaps in real
-data without changing the panel. The protection state card next to them is
-real, not a placeholder, as of M5.
+The forecast panel is backed by the real M6 forecasting module (see
+"Forecasting" below), the "Economic dispatch" decision-variables card shows
+the real M7 dispatch engine's decision (whether it's active, the battery's
+setpoint, and its projected horizon cost), and the protection state card
+shows the real M5 state machine — no placeholders remain in the
+decision-variables panel as of M7.
 
 Options: `--host`, `--port`, `--telemetry-db`, `--step-seconds`.
 
@@ -210,6 +215,29 @@ visible result, and typically shows `SeasonalAverageForecaster` cutting the
 error roughly by a third to a half versus plain persistence once a full
 day's history has accumulated. Options: `--scenario`
 (`normal_day`/`household_day`), `--step-seconds`, `--duration-hours`.
+
+## Dispatch
+
+`microgridmanager.dispatch.DispatchEngine` (M7) is a rolling-horizon economic
+dispatch engine: each tick, it forecasts PV and household load over a
+horizon (using the same M6 forecasting module), then solves a linear program
+(via [PuLP](https://coin-or.github.io/pulp/) with its bundled CBC solver)
+that picks the battery's charge/discharge and an EV charger's charging power
+to minimize net grid cost, subject to their physical limits and — for the EV
+— reaching a target state of charge by a known plug-out deadline. It's
+active in `household_day` only while the grid is available (per the M5
+protection state machine); while islanded, both fall back to the original
+resilience-first self-consumption rule, since there's no price signal to
+optimize against without a grid to trade with.
+
+`make dispatch-report` (or, on Windows, `uv run python -m
+simulation.dispatch_report`) is M7's visible result: it runs `household_day`
+twice — once with dispatch on, once with the original fixed rule — and
+prints the total grid-cost difference. A 24-hour run typically shows the
+dispatch-optimized day costing roughly half the naive rule's, mostly by
+shifting the EV's charging to cheap overnight hours and using the battery to
+avoid importing during the evening price peak. Options: `--step-seconds`,
+`--duration-hours`.
 
 ## Development conventions
 

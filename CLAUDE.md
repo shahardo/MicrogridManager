@@ -11,9 +11,10 @@ a single microgrid to utility-wide orchestration of many microgrids, unifies rea
 hardware control and simulation behind one control interface, and assumes
 multi-tenant ownership with intermittent connectivity between tiers.
 
-Current status: Phase 1 implementation, M6 (forecasting) complete; following
-the phased roadmap in `docs/architecture.md` §6 and `docs/phase-1-dev-plan.md`,
-starting with a single-site controller + simulation.
+Current status: Phase 1 implementation, M7 (optimization/dispatch engine)
+complete; following the phased roadmap in `docs/architecture.md` §6 and
+`docs/phase-1-dev-plan.md`, starting with a single-site controller +
+simulation.
 
 ## Working conventions (always follow these)
 
@@ -167,6 +168,53 @@ starting with a single-site controller + simulation.
     milestone's CLI visible result — both replace the *callers* of the old
     placeholder without changing the dashboard's forecast panel, since the
     series names stay the same.
+- `src/microgridmanager/dispatch/engine.py` — **M7's rolling-horizon economic
+  dispatch engine**. `DispatchEngine` owns its own PV/load forecast history
+  (two more `SeasonalAverageForecaster`s, same pattern as M6's — see its
+  module docstring for why the water heater is deliberately *not* a third
+  controlled asset here, just folded into the forecasted `load_actual_w`)
+  and, each `dispatch()` call, forecasts a horizon (`horizon_hours`, default
+  4.0 — chosen for LP solve speed; see the "M7 test performance" note below)
+  and solves an LP (`pulp`, bundled CBC solver via `PULP_CBC_CMD`) that
+  minimizes net grid cost by choosing the battery's charge/discharge and an
+  optional EV charger's charging power, returning a `DispatchPlan` whose
+  index-0 values (`battery_setpoint_w`/`ev_setpoint_w`) are this tick's
+  decision. Two real bugs surfaced while building this, both about the LP
+  having no reason to behave sensibly at its own edges — read
+  `_solve`'s comments before changing the objective or the EV target
+  handling:
+  - **No terminal value** for energy left in the battery at the end of the
+    horizon meant the LP would happily drain a fully-charged battery for a
+    quick sale on the last step, since nothing beyond the horizon exists in
+    its world. Fixed by crediting final battery energy at the horizon's
+    average import price (`terminal_value` in `_solve`) — deliberately
+    battery-only, not applied to the EV, since its target-SoC constraints
+    already capture what charge it needs to keep.
+  - **Infeasible EV targets** (a deadline that can't be reached at rated
+    power in the time available) would otherwise make the *whole tick's*
+    LP infeasible and raise `DispatchInfeasibleError`. `_clamped_ev_targets`
+    proactively caps each target at what's actually achievable by that step,
+    so an over-ambitious target still gets the best charge possible instead
+    of failing the tick — see
+    `tests/unit/dispatch/test_engine.py::test_unreachable_ev_target_is_clamped_instead_of_raising`.
+
+  `EVChargingState` is dispatch's own generic shape for "which horizon steps
+  is a controllable EV plugged in, and what SoC must it reach by when" —
+  `household_day._ev_dispatch_state()` is what translates a concrete
+  `SimulatedEVChargerAdapter`'s known `sessions` (see the adapter's new
+  `sessions` read-only property) into it, so the dispatch package itself
+  never imports anything scenario- or adapter-specific.
+
+  **M7 test performance**: solving an LP every tick adds real cost (~14ms at
+  the 4h/48-step default horizon on this machine) that a 288-tick (24h,
+  5-minute-step) batch run makes very noticeable — an early version of this
+  milestone's tests took over a minute. `tests/scenarios/test_household_day.py`
+  responds two ways: (1) every pre-existing M2/M4/M5 test now passes
+  `dispatch_enabled=False`, since they check scenario physics/wiring that
+  holds regardless of control strategy and dispatch has its own fast, fine-
+  grained unit tests; (2) the dedicated dispatch/cost tests use a coarser
+  10-minute step. Keep both practices for any new scenario test that doesn't
+  specifically need dispatch turned on.
 - `simulation/` — not part of the installed package; run via
   `python -m simulation.runner` (needs `pythonpath = ["."]` in
   `pyproject.toml`'s pytest config, already set, for tests to import it too).
@@ -229,6 +277,27 @@ starting with a single-site controller + simulation.
       crossing, produces exactly `NORMAL → ISLANDING_TRANSITION → ISLANDED →
       BLACK_START → RESTORATION → NORMAL`, zero grid power throughout, and
       every load shed at some point and restored by the end).
+    - **M7**: replaces the fixed self-consumption rule with the real
+      `microgridmanager.dispatch.DispatchEngine`, but only while
+      `decision.grid_exchange_allowed()` (`dispatch_active` in the row) —
+      islanded/black-starting has no grid to optimize against, so both
+      battery and EV fall back to the pre-M7 rule/auto-charge exactly as
+      before. `dispatch_enabled=False` (threaded through `build_scenario`/
+      `step_scenario`/`run()`) reverts to that same fallback even while
+      grid-connected — the "naive baseline"
+      `simulation/dispatch_report.py` compares against. Water heater is
+      stepped *before* the dispatch/fallback branch (reordered from the
+      pre-M7 sequence) purely so its real post-step reading is available as
+      part of the combined `load_actual_w` dispatch forecasts, since it's
+      exogenous to dispatch either way. `_ev_dispatch_state()` builds the
+      EV's per-horizon-step plugged-in/target-SoC input from its `sessions`
+      property. New row fields: `dispatch_active` (1.0/0.0) and
+      `dispatch_projected_cost_usd` (the LP's own horizon-cost estimate,
+      surfaced for visibility, not used for control). **Sign convention
+      note**: `plan.battery_setpoint_w` already matches
+      `SimulatedBatteryAdapter`'s own convention (+ = discharge, - =
+      charge) — apply it directly, don't renegate it (an earlier draft did
+      and inverted every dispatch-driven battery decision).
   - `runner.py` — CLI: `--scenario` (`normal_day` or `household_day`),
     `--step-seconds`, `--duration-hours`, `--output`, `--telemetry-db`,
     `--run-id`, and (household_day only, M5) `--outage-start-hour`/
@@ -240,6 +309,12 @@ starting with a single-site controller + simulation.
     (`output/telemetry.db` by default). `record_telemetry()` is the one place
     that translates a scenario's row-dict output into telemetry samples — the
     scenario/adapter code itself stays telemetry-agnostic.
+  - `dispatch_report.py` — **M7's visible result**: CLI (`python -m
+    simulation.dispatch_report`, `make dispatch-report`) running
+    `household_day` twice (dispatch on vs. `dispatch_enabled=False`) and
+    printing the total grid-cost difference — e.g. a 24h/300s run shows the
+    dispatch-optimized day costing roughly half the naive rule's. Flags:
+    `--step-seconds`, `--duration-hours`.
   - `live_engine.py` — **M4's `SimulationEngine`**: drives `household_day`
     one `tick()` at a time (rather than a fixed batch loop) so the dashboard
     can show it running live. Passes its `grid_connected` (the dashboard's
@@ -249,9 +324,12 @@ starting with a single-site controller + simulation.
     row: `pv_power_forecast_w`/`household_load_power_forecast_w` (since M6,
     a real `microgridmanager.forecasting.SeasonalAverageForecaster` per
     series — see below — replacing the M4 dashboard's inline
-    `persistence_forecast` placeholder; `battery_soc_headroom` and
-    `charge_rule_output_w` remain M7 dispatch placeholders) and
-    `grid_projected_import/export_price_per_kwh` via `grid.peek_price()`)
+    `persistence_forecast` placeholder; `battery_soc_headroom` is a plain
+    derived value and `charge_rule_output_w` mirrors `row["battery_power_w"]`
+    — since M7 that's the real dispatch/fallback-rule decision, not a
+    placeholder, kept under this name only because the dashboard's card
+    already reads it) and `grid_projected_import/export_price_per_kwh` via
+    `grid.peek_price()`)
     before recording to telemetry and appending to a rolling in-memory
     `history` deque the live charts read from. Maintains a small per-series
     `deque[HistoricalPoint]` (bounded to the forecaster's lookback window
@@ -321,13 +399,16 @@ starting with a single-site controller + simulation.
   computes the forecast panel's fields from the real
   `microgridmanager.forecasting` module instead, with no change to this
   module or its panels, per the Phase 1 plan's tracked placeholder-to-real
-  swaps (M7's dispatch placeholders — `battery_soc_headroom`,
-  `charge_rule_output_w` — are still inline in `live_engine.py`, not in a
-  separate placeholders module, and remain until M7). `static/app.js`
-  decodes the numeric `protection_state` field back to
-  a label (`PROTECTION_STATE_LABELS`, mirrors
-  `microgridmanager.protection.state_machine.PROTECTION_STATE_CODES` by
-  hand — update both if the states ever change) for the "Protection state
+  swaps. The decision-variables panel's last placeholder is gone as of M7
+  too: its "Economic dispatch" card (`static/app.js`, replacing the old
+  "Battery rule (placeholder, M7 replaces this)" card) shows
+  `dispatch_active`, `battery_soc_headroom`, `charge_rule_output_w`, and
+  `dispatch_projected_cost_usd` — all real fields from
+  `household_day.step_scenario` now, with no dashboard/API changes needed
+  beyond that one card's label and fields. `static/app.js` decodes the
+  numeric `protection_state` field back to a label (`PROTECTION_STATE_LABELS`,
+  mirrors `microgridmanager.protection.state_machine.PROTECTION_STATE_CODES`
+  by hand — update both if the states ever change) for the "Protection state
   machine" decision card and the `chart-protection` chart (state plus each
   load's served/shed flag over time — M5's dashboard-visible result). Polls
   `/api/state` + `/api/history` every second in Live mode; Replay mode lists
@@ -378,7 +459,20 @@ starting with a single-site controller + simulation.
     monotonic, the tariff actually switches peak/off-peak, and the grid's
     reported power always equals the residual of every other device's
     balance) — plus the M5 outage/black-start/restoration exit-criteria test
-    (see the `household_day.py` entry above).
+    and the M7 dispatch exit-criteria tests (see the `household_day.py`
+    entry above). Every M2/M4/M5 test here passes `dispatch_enabled=False`
+    and the M7-specific tests use a coarser step — see this file's own
+    module docstring and the "M7 test performance" note under
+    `dispatch/engine.py` above before adding a new scenario test.
+  - `tests/unit/dispatch/test_engine.py` — **M7's** direct unit tests for
+    `DispatchEngine`/`_solve`: plan shape, every physical bound (rated
+    power, SoC), the terminal-value fix (charges from surplus even on a
+    flat tariff, prefers discharging into a visible price spike over an
+    equally-flat cheap period), the EV target-SoC-by-deadline constraint,
+    plugged-in-window bounds, the target-clamping fix, and that forecasts
+    never see the current tick's own actual — all with no scenario/adapter
+    involved, so they stay fast regardless of how expensive a full scenario
+    run with dispatch enabled is.
   - `tests/unit/dashboard/` — `test_app.py` drives the FastAPI app's API
     (state/history/controls/runs/series) via `TestClient`, ticking the engine
     manually rather than relying on the real-time background loop so tests
@@ -395,13 +489,16 @@ starting with a single-site controller + simulation.
   Phase 1 tech stack table) and `httpx` to the `dev` group (required by
   FastAPI's `TestClient`). M5 adds none (the state machine is pure Python
   logic, no I/O). M6 adds none either (the forecasting module is pure Python
-  logic over plain in-memory sequences, no I/O).
+  logic over plain in-memory sequences, no I/O). M7 adds `pulp` (LP
+  modeling + a bundled CBC solver via `PULP_CBC_CMD`) — per the Phase 1 tech
+  stack table's "PuLP (LP) to start" choice.
 - `Makefile` — `make test` (pytest), `make lint` (ruff), `make run-scenario`
   (runs the M2 normal-day scenario by default; pass `ARGS="--scenario
   household_day"` for M4's six-device scenario), `make query-telemetry
   ARGS="..."` (M3's CLI), `make run-dashboard` (M4's dashboard — starts a
   uvicorn server at `http://127.0.0.1:8000`), `make forecast-report
-  ARGS="..."` (M6's CLI — see `simulation/forecast_report.py` above). Native
-  Windows PowerShell usually does not ship with `make`, so Windows users
-  should run the equivalent `uv run ...` commands directly instead of
-  `make`.
+  ARGS="..."` (M6's CLI — see `simulation/forecast_report.py` above),
+  `make dispatch-report ARGS="..."` (M7's CLI — see
+  `simulation/dispatch_report.py` above). Native Windows PowerShell usually
+  does not ship with `make`, so Windows users should run the equivalent
+  `uv run ...` commands directly instead of `make`.

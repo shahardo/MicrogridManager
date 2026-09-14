@@ -98,9 +98,16 @@ function renderCards(row) {
       ["Current import price", fmtPrice(row.grid_import_price_per_kwh)],
       ["Projected import price", fmtPrice(row.grid_projected_import_price_per_kwh)],
     ]),
-    card("Battery rule (placeholder, M7 replaces this)", [
-      ["SoC headroom", fmtPct(row.battery_soc_headroom)],
-      ["Charge rule output", fmtW(row.charge_rule_output_w)],
+    card("Economic dispatch (M7)", [
+      ["Active", row.dispatch_active ? "yes (grid-connected)" : "no (self-consumption rule)"],
+      ["Battery SoC headroom", fmtPct(row.battery_soc_headroom)],
+      ["Battery setpoint", fmtW(row.charge_rule_output_w)],
+      [
+        "Projected horizon cost",
+        row.dispatch_projected_cost_usd === undefined
+          ? "n/a"
+          : `$${row.dispatch_projected_cost_usd.toFixed(3)}`,
+      ],
     ]),
     card("Protection state machine (M5)", [
       [

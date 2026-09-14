@@ -111,8 +111,9 @@ class SimulationEngine:
     def tick(self) -> dict:
         """Advance one control step and return this step's reading (the same
         row shape `household_day.step_scenario` produces — including its
-        real `protection_state`/`*_served` fields — plus the M4 dashboard's
-        remaining placeholder forecast/decision-variable fields)."""
+        real `protection_state`/`*_served`/`dispatch_active`/
+        `dispatch_projected_cost_usd` fields — plus a couple of small
+        dashboard-only derived/duplicate fields added below)."""
         row = household_day.step_scenario(
             self.assets, self._step_seconds, grid_connected=self.grid_connected
         )
@@ -133,6 +134,10 @@ class SimulationEngine:
         )
 
         row["battery_soc_headroom"] = 1.0 - row["battery_soc"]
+        # As of M7 this mirrors the real dispatch/self-consumption-rule
+        # decision (row["battery_power_w"]) rather than a placeholder — kept
+        # as its own field since the dashboard's decision-variables card
+        # already reads it under this name.
         row["charge_rule_output_w"] = row["battery_power_w"]
 
         projected_import_price, projected_export_price = self.assets.grid.peek_price(

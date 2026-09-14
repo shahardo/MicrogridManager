@@ -1,4 +1,4 @@
-.PHONY: test lint run-dashboard run-scenario query-telemetry forecast-report
+.PHONY: test lint run-dashboard run-scenario query-telemetry forecast-report dispatch-report
 
 test:
 	uv run pytest
@@ -17,3 +17,6 @@ query-telemetry:
 
 forecast-report:
 	uv run python -m simulation.forecast_report $(ARGS)
+
+dispatch-report:
+	uv run python -m simulation.dispatch_report $(ARGS)

@@ -1,14 +1,14 @@
-""""Household day" scenario (M4/M5): the extended six-device simulated
+""""Household day" scenario (M4/M5/M7): the extended six-device simulated
 environment — rooftop PV, a battery, a household load, an EV charger, a
 water heater, and a grid connection — driven through a scripted 24-hour day.
 
-Like `normal_day`, the economic control logic here is a fixed, explicit
-self-consumption script (battery charges from excess PV, discharges to cover
-shortfalls) — not the real dispatch engine (M7). The EV charger and water
-heater manage their own charging/reheat decisions internally (see their
-adapters' docstrings); this scenario just steps them and reads their status.
+Like `normal_day`, water heater reheat timing is self-managed (see its
+adapter's docstring); this scenario just steps it and reads its status,
+treating it as an exogenous, forecasted must-serve load rather than a
+dispatch-controlled one (a deliberate, documented scope cut — see
+`microgridmanager.dispatch.engine`'s module docstring).
 
-M5 adds the safety layer in front of all of that: every tick, `step_scenario`
+M5 adds the safety layer in front of everything: every tick, `step_scenario`
 runs the household/EV/water-heater loads' demand through a
 `ProtectionController` *before* deciding what they're actually allowed to
 draw — that gate is what decides whether the grid connection may exchange
@@ -17,6 +17,17 @@ power at all, and it's what sheds/restores loads in priority order
 deferrable and shed first) if `grid_connected` goes False. See
 `docs/architecture.md`'s protection/control-logic section and
 `microgridmanager.protection.state_machine` for the state diagram.
+
+M7 adds the real economic dispatch engine, active only while the protection
+decision allows grid exchange (`decision.grid_exchange_allowed()` — i.e.
+`NORMAL`/`RESTORATION`): the battery's charge/discharge and the EV charger's
+charging power are chosen by `microgridmanager.dispatch.DispatchEngine`'s
+rolling-horizon LP instead of the fixed self-consumption rule, using PV/load
+forecasts and the real tariff. While islanded/black-starting, there's no
+grid to optimize against, so both fall back to the original resilience-first
+self-consumption rule (charge from surplus, discharge to cover shortfall,
+EV auto-charges within whatever protection allows) — dispatch and
+resilience are different jobs, not one engine wearing two hats.
 """
 
 from __future__ import annotations
@@ -41,6 +52,7 @@ from microgridmanager.adapters.simulated.profiles import (
     household_water_draw_profile,
     time_of_use_tariff_profile,
 )
+from microgridmanager.dispatch import BatteryState, DispatchEngine, EVChargingState
 from microgridmanager.protection import (
     PROTECTION_STATE_CODES,
     ProtectionController,
@@ -53,6 +65,8 @@ DEFAULT_DURATION_HOURS = 24.0
 DEFAULT_EV_SESSION_HORIZON_DAYS = 365
 BATTERY_CAPACITY_WH = 13_500.0
 BATTERY_RATED_POWER_W = 5_000.0
+EV_CAPACITY_WH = 60_000.0
+EV_RATED_POWER_W = 7_200.0
 
 # Load-shedding priorities, lowest-is-most-critical (see SheddableLoad):
 # household circuits (fridge, lights, ...) stay on longest; the EV charger,
@@ -119,6 +133,7 @@ class HouseholdScenarioAssets:
     water_heater: SimulatedWaterHeaterAdapter
     grid: SimulatedGridConnectionAdapter
     protection: ProtectionController
+    dispatch: DispatchEngine
 
 
 def build_scenario(
@@ -150,8 +165,8 @@ def build_scenario(
     ev_charger = SimulatedEVChargerAdapter(
         "ev-charger-1",
         clock=clock,
-        capacity_wh=60_000.0,
-        rated_power_w=7_200.0,
+        capacity_wh=EV_CAPACITY_WH,
+        rated_power_w=EV_RATED_POWER_W,
         initial_soc=0.3,
         sessions=_daily_ev_sessions(start),
         # A daily commute's worth of driving (~30 miles at ~300 Wh/mile) so
@@ -171,6 +186,7 @@ def build_scenario(
         "grid-1", clock=clock, tariff_profile=time_of_use_tariff_profile()
     )
     protection = ProtectionController()
+    dispatch = DispatchEngine(step_seconds=step_seconds)
 
     return HouseholdScenarioAssets(
         clock=clock,
@@ -181,11 +197,44 @@ def build_scenario(
         water_heater=water_heater,
         grid=grid,
         protection=protection,
+        dispatch=dispatch,
+    )
+
+
+def _ev_dispatch_state(
+    ev_charger: SimulatedEVChargerAdapter, now: datetime, step_seconds: float, horizon_steps: int
+) -> EVChargingState:
+    """Translate the EV charger's known session schedule (`sessions` — see
+    its docstring) into the generic `EVChargingState` the dispatch engine
+    consumes: which horizon steps it's plugged in, and, for whichever step
+    contains each session's deadline (if that falls within the horizon at
+    all), the state of charge it must reach by then."""
+    sessions = ev_charger.sessions
+    plugged_in = []
+    target_soc_by_step: dict[int, float] = {}
+    for k in range(horizon_steps):
+        step_start = now + timedelta(seconds=step_seconds * k)
+        step_end = now + timedelta(seconds=step_seconds * (k + 1))
+        session = next((s for s in sessions if s.plug_in <= step_start < s.deadline), None)
+        plugged_in.append(session is not None)
+        if session is not None and step_start < session.deadline <= step_end:
+            target_soc_by_step[k] = session.target_soc
+
+    return EVChargingState(
+        state_of_charge=ev_charger.get_state_of_charge(),
+        capacity_wh=EV_CAPACITY_WH,
+        rated_power_w=EV_RATED_POWER_W,
+        plugged_in=plugged_in,
+        target_soc_by_step=target_soc_by_step,
     )
 
 
 def step_scenario(
-    assets: HouseholdScenarioAssets, dt_seconds: float, *, grid_connected: bool = True
+    assets: HouseholdScenarioAssets,
+    dt_seconds: float,
+    *,
+    grid_connected: bool = True,
+    dispatch_enabled: bool = True,
 ) -> dict:
     """Advance one control step.
 
@@ -198,10 +247,16 @@ def step_scenario(
     then have their setpoint forced to zero *before* `step()` runs, so the
     decision actually takes effect rather than just being reported.
 
-    After that: the EV charger and water heater integrate themselves, the
-    scripted battery self-consumption rule runs against the (possibly
-    shed-reduced) total load, and the grid connection absorbs the residual —
-    but only if the protection decision allows grid exchange this tick;
+    The water heater is stepped next (it's exogenous to dispatch either way,
+    self-managed or shed), so its real post-step reading is available for
+    the M7 dispatch engine's combined "must-serve load" input. Then: while
+    the protection decision allows grid exchange (NORMAL/RESTORATION), the
+    battery and EV charger's setpoints for this tick come from
+    `assets.dispatch`'s rolling-horizon economic plan; otherwise (islanded or
+    black-starting — no grid to optimize against) both fall back to the
+    original resilience-first self-consumption rule, with the EV simply
+    auto-charging (or being shed) like before M7. Finally the grid connection
+    absorbs the residual — but only if grid exchange is allowed this tick;
     otherwise the PCC is treated as physically open and carries zero power
     regardless of any residual imbalance.
 
@@ -260,26 +315,73 @@ def step_scenario(
         assets.household_load.set_active_power_w(0.0)
         household_state = assets.household_load.get_state()
 
-    if decision.served["ev_charger"]:
-        assets.ev_charger.clear_override()
-    else:
-        assets.ev_charger.set_active_power_w(0.0)
-    assets.ev_charger.step(dt_seconds)
-    ev_state = assets.ev_charger.get_state()
-
     assets.water_heater.set_shed(not decision.served["water_heater"])
     assets.water_heater.step(dt_seconds)
     water_heater_state = assets.water_heater.get_state()
 
+    dispatch_active = dispatch_enabled and decision.grid_exchange_allowed()
+    dispatch_projected_cost = 0.0
+    if dispatch_active:
+        # Guaranteed true whenever grid exchange is allowed — see
+        # ProtectionController._shed_decision — so there's no separate
+        # "served but not dispatched" case to handle here.
+        assert decision.served["ev_charger"]
+
+        ev_dispatch_state = _ev_dispatch_state(
+            assets.ev_charger, assets.clock.now, dt_seconds, assets.dispatch.horizon_steps
+        )
+        battery_dispatch_state = BatteryState(
+            state_of_charge=battery_soc,
+            capacity_wh=BATTERY_CAPACITY_WH,
+            rated_power_w=BATTERY_RATED_POWER_W,
+        )
+        plan = assets.dispatch.dispatch(
+            now=assets.clock.now,
+            pv_actual_w=pv_state.active_power_w,
+            load_actual_w=household_state.active_power_w + water_heater_state.active_power_w,
+            battery=battery_dispatch_state,
+            tariff_at=assets.grid.peek_price,
+            ev=ev_dispatch_state,
+        )
+        dispatch_projected_cost = plan.projected_cost
+
+        assets.ev_charger.set_active_power_w(plan.ev_setpoint_w or 0.0)
+        assets.ev_charger.step(dt_seconds)
+        ev_state = assets.ev_charger.get_state()
+
+        # plan.battery_setpoint_w already uses the same sign convention as
+        # the adapter (+ = discharge, - = charge) — see DispatchPlan's
+        # docstring — so it's applied directly, not negated.
+        assets.battery.set_active_power_w(plan.battery_setpoint_w)
+        assets.battery.step(dt_seconds)
+        battery_state = assets.battery.get_state()
+    else:
+        if decision.served["ev_charger"]:
+            assets.ev_charger.clear_override()
+        else:
+            assets.ev_charger.set_active_power_w(0.0)
+        assets.ev_charger.step(dt_seconds)
+        ev_state = assets.ev_charger.get_state()
+
+        uncontrolled_load_w = (
+            household_state.active_power_w
+            + ev_state.active_power_w
+            + water_heater_state.active_power_w
+        )
+        net_surplus_w = pv_state.active_power_w - uncontrolled_load_w
+        assets.battery.set_active_power_w(-net_surplus_w)
+        assets.battery.step(dt_seconds)
+        battery_state = assets.battery.get_state()
+
     total_load_w = (
         household_state.active_power_w + ev_state.active_power_w + water_heater_state.active_power_w
     )
-    net_surplus_w = pv_state.active_power_w - total_load_w
-    assets.battery.set_active_power_w(-net_surplus_w)
-    assets.battery.step(dt_seconds)
-    battery_state = assets.battery.get_state()
-
     residual_w = total_load_w - pv_state.active_power_w - battery_state.active_power_w
+    # Grid eligibility is a protection-state property, independent of
+    # whether dispatch itself is enabled — the naive baseline
+    # (dispatch_enabled=False) must still trade normally with the grid
+    # whenever it's connected, exactly like the pre-M7 self-consumption rule
+    # did; only the *choice* of battery/EV setpoints changes with dispatch.
     assets.grid.set_net_power_w(residual_w if decision.grid_exchange_allowed() else 0.0)
     assets.grid.step(dt_seconds)
     grid_state = assets.grid.get_state()
@@ -311,6 +413,8 @@ def step_scenario(
         "grid_cumulative_export_wh": grid_state.cumulative_export_wh,
         "grid_connected": float(grid_connected),
         "protection_state": float(PROTECTION_STATE_CODES[decision.state]),
+        "dispatch_active": float(dispatch_active),
+        "dispatch_projected_cost_usd": dispatch_projected_cost,
     }
 
 
@@ -320,11 +424,17 @@ def run(
     duration_hours: float = DEFAULT_DURATION_HOURS,
     start: datetime | None = None,
     grid_connected_at: Callable[[datetime], bool] | None = None,
+    dispatch_enabled: bool = True,
 ) -> list[dict]:
     """Run the scenario. `grid_connected_at`, if given, is evaluated against
     the clock each tick to drive the M5 protection state machine — e.g.
     `grid_outage_between(t0, t1)` for an outage/black-start/restoration
-    demonstration. Defaults to an always-connected grid (M4's behavior)."""
+    demonstration. Defaults to an always-connected grid (M4's behavior).
+
+    `dispatch_enabled=False` (M7) reverts to the original fixed
+    self-consumption rule for the battery/EV even while grid-connected — the
+    "naive baseline" `simulation/dispatch_report.py` compares the real
+    dispatch engine against."""
     assets = build_scenario(start=start, step_seconds=step_seconds)
     num_steps = int(duration_hours * 3600.0 / step_seconds)
     grid_connected_at = grid_connected_at or (lambda _now: True)
@@ -332,7 +442,14 @@ def run(
     rows = []
     for _ in range(num_steps):
         grid_connected = grid_connected_at(assets.clock.now)
-        rows.append(step_scenario(assets, step_seconds, grid_connected=grid_connected))
+        rows.append(
+            step_scenario(
+                assets,
+                step_seconds,
+                grid_connected=grid_connected,
+                dispatch_enabled=dispatch_enabled,
+            )
+        )
         assets.clock.tick()
 
     return rows

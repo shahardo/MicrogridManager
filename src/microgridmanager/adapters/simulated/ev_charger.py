@@ -80,6 +80,15 @@ class SimulatedEVChargerAdapter(AssetAdapter, PowerControllable, StateOfChargeRe
     def asset_type(self) -> AssetType:
         return AssetType.EV_CHARGER
 
+    @property
+    def sessions(self) -> tuple[EVSession, ...]:
+        """Read-only view of this charger's known plug-in schedule (sorted by
+        `plug_in`), so a dispatch engine (M7) can see plugged-in windows and
+        deadlines over its planning horizon — sessions are deterministic and
+        known in advance here, the same way a real system would know a
+        charging deadline from the vehicle or a scheduling app."""
+        return tuple(self._sessions)
+
     def set_active_power_w(self, watts: float) -> None:
         self._override_w = watts
         self._active_power_w = watts
