@@ -18,6 +18,8 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 from microgridmanager.protection import PROTECTION_STATE_CODES, ProtectionState
 from simulation.runner import write_csv
 from simulation.scenarios import household_day
@@ -236,6 +238,100 @@ def test_dispatch_active_flag_tracks_grid_availability() -> None:
             float(PROTECTION_STATE_CODES[ProtectionState.RESTORATION]),
         )
         assert row["dispatch_active"] == float(expected_active)
+
+
+def test_manual_overrides_are_applied_while_grid_connected() -> None:
+    """M9 exit-criteria test (applied case): battery/EV/water-heater manual
+    overrides take effect while the site is in a state (NORMAL, here) that
+    permits them, and each device's actual reading reflects the requested
+    setpoint rather than dispatch's/the fallback rule's own decision."""
+    assets = household_day.build_scenario(step_seconds=300.0)
+    overrides = household_day.ManualOverrides(
+        battery_power_w=1_000.0, ev_power_w=500.0, water_heater_force_heating=True
+    )
+
+    row = household_day.step_scenario(
+        assets, 300.0, grid_connected=True, dispatch_enabled=False, overrides=overrides
+    )
+
+    assert row["battery_override_active"] == 1.0
+    assert row["battery_override_applied"] == 1.0
+    assert row["battery_power_w"] == pytest.approx(1_000.0, rel=1e-3)
+
+    assert row["ev_override_active"] == 1.0
+    assert row["ev_override_applied"] == 1.0
+    assert row["ev_power_w"] == pytest.approx(500.0, rel=1e-3)
+
+    assert row["water_heater_override_active"] == 1.0
+    assert row["water_heater_override_applied"] == 1.0
+    assert row["water_heater_heating"] == 1.0
+
+
+def test_manual_overrides_are_rejected_while_islanded() -> None:
+    """M9 exit-criteria test (rejected case): the same overrides, requested
+    throughout a scripted grid outage, are visibly rejected (active but not
+    applied) for the entire time the site isn't grid-connected — the manual
+    override path is routed through the same protection gate as automated
+    control, not a side door around it — and go back to being applied once
+    the grid (and NORMAL operation) returns."""
+    start = household_day.DEFAULT_START
+    outage_start = start + timedelta(hours=1)
+    outage_end = start + timedelta(hours=5)
+    grid_connected_at = household_day.grid_outage_between(outage_start, outage_end)
+    overrides = household_day.ManualOverrides(
+        battery_power_w=1_000.0, ev_power_w=1_000.0, water_heater_force_heating=True
+    )
+
+    assets = household_day.build_scenario(start=start, step_seconds=300.0)
+    step_seconds = 300.0
+    num_steps = int(8 * 3600.0 / step_seconds)
+    rows = []
+    for _ in range(num_steps):
+        grid_connected = grid_connected_at(assets.clock.now)
+        rows.append(
+            household_day.step_scenario(
+                assets,
+                step_seconds,
+                grid_connected=grid_connected,
+                dispatch_enabled=False,
+                overrides=overrides,
+            )
+        )
+        assets.clock.tick()
+
+    not_grid_connected_states = {
+        PROTECTION_STATE_CODES[ProtectionState.ISLANDING_TRANSITION],
+        PROTECTION_STATE_CODES[ProtectionState.ISLANDED],
+        PROTECTION_STATE_CODES[ProtectionState.BLACK_START],
+    }
+    islanded_rows = [row for row in rows if row["protection_state"] in not_grid_connected_states]
+    normal_rows = [
+        row
+        for row in rows
+        if row["protection_state"] == PROTECTION_STATE_CODES[ProtectionState.NORMAL]
+    ]
+    assert islanded_rows, "scenario should spend time off-grid during the scripted outage"
+    assert normal_rows, "scenario should also spend time grid-connected"
+
+    for row in islanded_rows:
+        assert row["battery_override_active"] == 1.0
+        assert row["battery_override_applied"] == 0.0
+        assert row["ev_override_active"] == 1.0
+        assert row["ev_override_applied"] == 0.0
+        assert row["water_heater_override_active"] == 1.0
+        assert row["water_heater_override_applied"] == 0.0
+
+    for row in normal_rows:
+        # The battery itself may be too depleted after the outage to fully
+        # honor 1000W (the adapter correctly clamps to available energy —
+        # see `SimulatedBatteryAdapter.step`), so check the EV override's
+        # exact value instead: its state of charge is untouched by the
+        # outage, so nothing should clamp it here.
+        assert row["battery_override_applied"] == 1.0
+        assert row["ev_override_applied"] == 1.0
+        assert row["ev_power_w"] == pytest.approx(1_000.0, rel=1e-3)
+        assert row["water_heater_override_applied"] == 1.0
+        assert row["water_heater_heating"] == 1.0
 
 
 def test_write_csv_produces_a_readable_file_with_all_rows(tmp_path: Path) -> None:

@@ -54,6 +54,49 @@
     <div class="device-cards" id="decision-cards"></div>
   </section>
 
+  <section id="overrides-panel" class="panel">
+    <h2>Manual overrides (M9)</h2>
+    <p class="hint">
+      Overrides are routed through the same protection gate as automated
+      control (M5) — one that isn't currently safe (e.g. a shed load, or
+      during an islanding/black-start transition) is rejected, visible in
+      the "Manual overrides" decision card above.
+    </p>
+    <div class="controls-row">
+      <label>Battery power (W, + discharge / - charge)
+        <input id="battery-override-input" type="number" step="100" placeholder="auto" />
+      </label>
+      <button id="battery-override-set">Set</button>
+      <button id="battery-override-clear">Clear</button>
+    </div>
+    <div class="controls-row">
+      <label>EV charger power (W)
+        <input id="ev-override-input" type="number" step="100" min="0" placeholder="auto" />
+      </label>
+      <button id="ev-override-set">Set</button>
+      <button id="ev-override-clear">Clear</button>
+    </div>
+    <div class="controls-row">
+      <label>Water heater
+        <select id="water-heater-override-select">
+          <option value="auto">Auto</option>
+          <option value="on">Force on</option>
+          <option value="off">Force off</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <section id="device-adapters-panel" class="panel">
+    <h2>Device adapters</h2>
+    <p class="hint">
+      Every device runs the simulated adapter for now — the real/simulated
+      selector below is wired up and ready, but a real Modbus/SunSpec
+      adapter to select isn't implemented yet.
+    </p>
+    <div class="device-cards" id="device-adapter-cards"></div>
+  </section>
+
   <section class="panel">
     <h2>Power (W)</h2>
     <canvas id="chart-power" width="900" height="260"></canvas>
@@ -75,7 +118,7 @@
   </section>
 
   <section class="panel">
-    <h2>Forecast vs actual (placeholder persistence model, M6 replaces this)</h2>
+    <h2>Forecast vs actual (M6 seasonal-average model)</h2>
     <canvas id="chart-forecast" width="900" height="220"></canvas>
   </section>
 

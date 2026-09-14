@@ -11,10 +11,18 @@ a single microgrid to utility-wide orchestration of many microgrids, unifies rea
 hardware control and simulation behind one control interface, and assumes
 multi-tenant ownership with intermittent connectivity between tiers.
 
-Current status: Phase 1 implementation, M7 (optimization/dispatch engine)
-complete; following the phased roadmap in `docs/architecture.md` §6 and
-`docs/phase-1-dev-plan.md`, starting with a single-site controller +
-simulation.
+Current status: Phase 1 implementation, M9 (dashboard integration & manual
+overrides) complete; following the phased roadmap in `docs/architecture.md`
+§6 and `docs/phase-1-dev-plan.md`, starting with a single-site controller +
+simulation. **M8 (real Modbus/SunSpec adapters) was deliberately deferred**
+and done *after* M9, not before it as the dev plan orders them — M9's
+manual-override wiring doesn't need real adapters to exist, and its "per-
+device real/simulated adapter selector" sub-bullet is scoped down
+accordingly (see the `simulation/live_engine.py` and dashboard entries
+below): the selector reports every device as `"simulated"`-only rather than
+offering a real option that doesn't work yet. M8, whenever it lands, should
+register a real adapter mode there rather than reopening this file's other
+M9 changes.
 
 ## Working conventions (always follow these)
 
@@ -99,7 +107,12 @@ simulation.
     element off regardless of hysteresis. It has no `PowerControllable`
     setpoint to override like the other loads, so M5's protection layer
     sheds it this way instead — the tank still depletes from draws either
-    way, only reheating is disabled.
+    way, only reheating is disabled. **M9** adds a second, separate
+    `set_manual_heating_override(bool | None)`: an operator-driven force-on/
+    force-off, distinct from `set_shed` (a safety decision) — `set_shed`
+    always wins over it inside `step()`; the calling scenario is
+    responsible for only invoking the manual override when its own gating
+    says that's safe (see `household_day._override_allowed` below).
 - `src/microgridmanager/protection/state_machine.py` — **the M5 protection &
   control state machine**: `ProtectionState` (`NORMAL` ↔
   `ISLANDING_TRANSITION` ↔ `ISLANDED` ↔ `BLACK_START` ↔ `RESTORATION`,
@@ -298,6 +311,34 @@ simulation.
       `SimulatedBatteryAdapter`'s own convention (+ = discharge, - =
       charge) — apply it directly, don't renegate it (an earlier draft did
       and inverted every dispatch-driven battery decision).
+    - **M9**: adds `ManualOverrides` (`battery_power_w`/`ev_power_w`/
+      `water_heater_force_heating`, each `None` meaning "no override,
+      automatic control decides") and `_override_allowed(decision,
+      served_key=None)`, the gate every override is checked against —
+      allowed only while `decision.grid_exchange_allowed()` (`NORMAL`/
+      `RESTORATION`): while islanded/black-starting, the resilience-first
+      fallback rule has full authority over the battery/EV/water heater to
+      keep whatever critical loads it can powered, and a manual override
+      must never be able to second-guess it, so this is the same "final
+      gate" invariant M5 enforces against automated control, applied to
+      manual control too. `served_key` additionally rejects an override for
+      a load protection has actually shed (`None` for the battery, which
+      isn't a `SheddableLoad`). Applied at the exact point each device's
+      setpoint would otherwise be written — after dispatch/the fallback
+      rule has already decided what it *would* do, so there's always a
+      well-defined automatic value to fall back to when an override is
+      rejected. New row fields (always present, so replay's
+      position-for-position `reconstructRows` stays aligned even on a tick
+      with no override pending):
+      `battery_override_active`/`battery_override_power_w`/
+      `battery_override_applied` and the same three fields for
+      `ev_override_*`/`water_heater_override_*` (`water_heater_override_
+      heating` instead of `_power_w`) — `*_active` is whether an override
+      was requested this tick at all, `*_applied` is whether the gate let
+      it through, so active-but-not-applied is a visibly rejected override
+      rather than a silently dropped one. See
+      `tests/scenarios/test_household_day.py::test_manual_overrides_are_applied_while_grid_connected`
+      and `::test_manual_overrides_are_rejected_while_islanded`.
   - `runner.py` — CLI: `--scenario` (`normal_day` or `household_day`),
     `--step-seconds`, `--duration-hours`, `--output`, `--telemetry-db`,
     `--run-id`, and (household_day only, M5) `--outage-start-hour`/
@@ -343,8 +384,15 @@ simulation.
     `runner.py`'s role for batch runs — see its module docstring for the
     small duck-typed interface `microgridmanager.dashboard.app` depends on
     instead of importing this directly, so the installed dashboard package
-    stays scenario-agnostic (M9 can point it at a real site controller
-    without changing it).
+    stays scenario-agnostic (a real site controller can be pointed at
+    without changing it). **M9** adds `set_battery_override`/
+    `set_ev_override`/`set_water_heater_override` (each just stashes the
+    requested value on a `household_day.ManualOverrides` that `tick()`
+    passes into `step_scenario` from then on — the actual apply-or-reject
+    decision lives entirely in `household_day._override_allowed`, not here)
+    and `device_adapter_modes()` (returns every device as `"simulated"`-only
+    — see the "Current status" note at the top of this file for why the
+    real option isn't backed yet).
   - `dashboard_runner.py` — CLI (`python -m simulation.dashboard_runner`,
     `make run-dashboard`) wiring a `TelemetryStore` + `SimulationEngine` into
     `microgridmanager.dashboard.app.create_app()` and serving it with
@@ -394,7 +442,12 @@ simulation.
   input to the protection state machine, not a placeholder), `GET /api/runs`
   / `GET /api/runs/{run_id}/series` (thin wrappers over `TelemetryStore`),
   and `GET /api/runs/{run_id}/data` (every series for a run, bundled for
-  replay). The M4 dashboard's `placeholders.py` (which held the inline
+  replay). **M9** adds `POST /api/controls/override/{battery,ev_charger,
+  water_heater}` (body `{power_w}` or `{force_heating}`; `null`/omitted
+  clears the override) and `GET /api/devices` (the per-device adapter-mode
+  listing from `engine.device_adapter_modes()`) — both just forward to the
+  engine, keeping this module's job routing HTTP to its small interface
+  rather than deciding anything itself. The M4 dashboard's `placeholders.py` (which held the inline
   `persistence_forecast()` stand-in) is gone as of M6 — `live_engine.py` now
   computes the forecast panel's fields from the real
   `microgridmanager.forecasting` module instead, with no change to this
@@ -417,7 +470,18 @@ simulation.
   series array position-for-position (`reconstructRows`), and scrubs through
   them client-side (play/pause/seek/speed) reusing the same card/chart
   renderers as the live view — proven to reproduce the live data exactly by
-  `tests/unit/dashboard/test_replay.py`.
+  `tests/unit/dashboard/test_replay.py`. **M9's** visible result:
+  `static/index.html`/`app.js` add a "Manual overrides" controls-panel
+  section (battery/EV power inputs + Set/Clear, a water-heater Auto/Force
+  on/Force off select) that POSTs to the new endpoints, a matching "Manual
+  overrides" decision card showing each device as `auto`, `<value> (applied)`,
+  or `<value> (REJECTED by protection gate)` from that tick's
+  `*_override_active`/`*_override_applied` fields, and a "Device adapters"
+  panel rendering `GET /api/devices`' listing (a plain label per device
+  today, not a working selector, since only `"simulated"` exists to select —
+  see the "Current status" note at the top of this file). Also fixes the
+  forecast chart's heading, which still said "placeholder persistence model,
+  M6 replaces this" after M6 had already replaced it.
 - `scripts/query_telemetry.py` — **M3's visible result**: CLI over the
   telemetry store. No `--run-id` lists runs; `--run-id` alone lists that
   run's series; `--run-id` + `--series` (optionally + `--asset-id`) prints
@@ -441,7 +505,10 @@ simulation.
     rated-power clamping, clock advancement, EV session plug/unplug and
     target-SoC charging, water heater hysteresis and tank bounds — including
     M5's `set_shed()` forcing the element off and releasing back to normal
-    hysteresis — grid cumulative import/export energy and tariff timing).
+    hysteresis, and M9's `set_manual_heating_override()` forcing it on/off
+    against hysteresis, `set_shed` winning over an active override, and
+    clearing an override resuming hysteresis — grid cumulative import/export
+    energy and tariff timing).
   - `tests/unit/protection/test_state_machine.py` — **M5's** direct unit
     tests for `ProtectionController`: every transition's guard condition
     (including same-tick grid recovery during `ISLANDING_TRANSITION`, the
@@ -458,12 +525,15 @@ simulation.
     EV only draws power while plugged in, grid cumulative energy is
     monotonic, the tariff actually switches peak/off-peak, and the grid's
     reported power always equals the residual of every other device's
-    balance) — plus the M5 outage/black-start/restoration exit-criteria test
-    and the M7 dispatch exit-criteria tests (see the `household_day.py`
-    entry above). Every M2/M4/M5 test here passes `dispatch_enabled=False`
-    and the M7-specific tests use a coarser step — see this file's own
-    module docstring and the "M7 test performance" note under
-    `dispatch/engine.py` above before adding a new scenario test.
+    balance) — plus the M5 outage/black-start/restoration exit-criteria test,
+    the M7 dispatch exit-criteria tests, and the M9 manual-override
+    exit-criteria tests (applied while grid-connected; visibly rejected —
+    active but not applied — for every tick of a scripted outage, back to
+    applied once `NORMAL` resumes) (see the `household_day.py` entry above).
+    Every M2/M4/M5/M9 test here passes `dispatch_enabled=False` and the
+    M7-specific tests use a coarser step — see this file's own module
+    docstring and the "M7 test performance" note under `dispatch/engine.py`
+    above before adding a new scenario test.
   - `tests/unit/dispatch/test_engine.py` — **M7's** direct unit tests for
     `DispatchEngine`/`_solve`: plan shape, every physical bound (rated
     power, SoC), the terminal-value fix (charges from surplus even on a
@@ -476,10 +546,14 @@ simulation.
   - `tests/unit/dashboard/` — `test_app.py` drives the FastAPI app's API
     (state/history/controls/runs/series) via `TestClient`, ticking the engine
     manually rather than relying on the real-time background loop so tests
-    stay deterministic; `test_replay.py` is the M4 replay exit-criteria test
-    — it ticks a `SimulationEngine` directly, captures the exact rows
-    returned, then asserts `GET /api/runs/{run_id}/data` reconstructs those
-    same rows value-for-value and timestamp-for-timestamp.
+    stay deterministic — including M9's override endpoints (each control
+    updates the engine and the next tick's row reflects it, including a
+    grid-disconnected case proving an override is actually rejected by the
+    protection gate, not just accepted by the API layer) and `/api/devices`;
+    `test_replay.py` is the M4 replay exit-criteria test — it ticks a
+    `SimulationEngine` directly, captures the exact rows returned, then
+    asserts `GET /api/runs/{run_id}/data` reconstructs those same rows
+    value-for-value and timestamp-for-timestamp.
 - `pyproject.toml` — project config; dependencies managed with `uv`
   (`uv sync --group dev` creates `.venv` and installs everything — never
   install packages globally). No new runtime dependencies were added through

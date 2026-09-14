@@ -97,6 +97,21 @@ body {
   width: 70px;
 }
 
+#overrides-panel .controls-row input[type="number"] {
+  width: 110px;
+}
+
+.hint {
+  margin: 0 0 10px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+select:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
 .run-id {
   margin-left: auto;
   color: var(--muted);

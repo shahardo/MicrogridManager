@@ -13,6 +13,15 @@ adapter has no `PowerControllable` setpoint to override (it manages its own
 heating decision), so M5's protection layer sheds it this way instead, the
 same as cutting power at the breaker. The tank keeps depleting from hot-water
 draws either way; only reheating is disabled.
+
+`set_manual_heating_override(True/False)` (M9) is a separate, operator-driven
+override: force the element on or off regardless of hysteresis, e.g. from the
+dashboard's manual-override controls. `set_shed` always wins over it (a
+protection-layer shed is a safety decision, not a preference) — the calling
+scenario is responsible for only invoking the manual override when its own
+gating (see `simulation.scenarios.household_day._override_allowed`) says
+that's safe. `set_manual_heating_override(None)` releases back to normal
+hysteresis control.
 """
 
 from __future__ import annotations
@@ -48,6 +57,7 @@ class SimulatedWaterHeaterAdapter(AssetAdapter):
         self._tank_energy_wh = capacity_wh * initial_tank_fraction
         self._heating = False
         self._shed = False
+        self._manual_override: bool | None = None
 
     @property
     def asset_id(self) -> str:
@@ -78,16 +88,26 @@ class SimulatedWaterHeaterAdapter(AssetAdapter):
         back to normal hysteresis control (`shed=False`)."""
         self._shed = shed
 
+    def set_manual_heating_override(self, heating: bool | None) -> None:
+        """M9's operator override: force the element on/off regardless of
+        hysteresis (`True`/`False`), or release it back to normal hysteresis
+        control (`None`). Always loses to `set_shed(True)` — see the class
+        docstring."""
+        self._manual_override = heating
+
     def step(self, dt_seconds: float) -> None:
         """Advance one tick: deplete the tank by this step's hot-water draw,
-        update the hysteresis heating state (unless shed), then replenish it
-        if heating."""
+        then decide the heating state — shed forces it off, an active manual
+        override takes the next say, and otherwise normal hysteresis applies
+        — then replenish the tank if heating."""
         dt_hours = dt_seconds / 3600.0
         draw_w = max(0.0, self._draw_profile(self._clock.now))
         self._tank_energy_wh -= draw_w * dt_hours
 
         if self._shed:
             self._heating = False
+        elif self._manual_override is not None:
+            self._heating = self._manual_override
         elif self.tank_energy_fraction <= self._low_fraction:
             self._heating = True
         elif self.tank_energy_fraction >= self._high_fraction:

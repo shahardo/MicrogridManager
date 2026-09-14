@@ -33,26 +33,36 @@ implementation roadmap.
 
 ## Status
 
-**Implementation in progress (Phase 1, M7 — optimization/dispatch engine).**
-The architecture and Phase 1 plan are defined (see `docs/architecture.md` §6
-and `docs/phase-1-dev-plan.md`). M1 delivered the canonical asset model and
-`AssetAdapter` interface; M2 added simulated PV, battery (BESS), controllable
-load, and diesel/gas generator adapters plus a shared discrete-time
-simulation clock, and a scripted "normal day" scenario that exercises them
-end-to-end; M3 added a durable, queryable telemetry store; M4 added an EV
-charger, a water heater, and a grid connection (with a time-of-use tariff) as
-three more simulated devices, a six-device "household day" scenario combining
-all of them, and a live/replay web dashboard; M5 added the safety-critical
-protection state machine — islanding detection, black start, and
-priority-ordered load shedding — in front of it all, driven either by the
-dashboard's grid connect/disconnect toggle or a scripted outage; M6 added a
-real forecasting module (a `Forecaster` interface plus persistence and
-same-time-of-day-average baseline models) that now drives the dashboard's
-forecast panel, replacing its original inline placeholder; M7 adds the real
-rolling-horizon economic dispatch engine — an LP that chooses the battery's
-and EV charger's schedules to minimize grid cost using those forecasts and
-the real tariff, replacing the original fixed self-consumption rule whenever
-the grid is available.
+**Implementation in progress (Phase 1, M9 — dashboard integration & manual
+overrides).** The architecture and Phase 1 plan are defined (see
+`docs/architecture.md` §6 and `docs/phase-1-dev-plan.md`). M1 delivered the
+canonical asset model and `AssetAdapter` interface; M2 added simulated PV,
+battery (BESS), controllable load, and diesel/gas generator adapters plus a
+shared discrete-time simulation clock, and a scripted "normal day" scenario
+that exercises them end-to-end; M3 added a durable, queryable telemetry
+store; M4 added an EV charger, a water heater, and a grid connection (with a
+time-of-use tariff) as three more simulated devices, a six-device "household
+day" scenario combining all of them, and a live/replay web dashboard; M5
+added the safety-critical protection state machine — islanding detection,
+black start, and priority-ordered load shedding — in front of it all, driven
+either by the dashboard's grid connect/disconnect toggle or a scripted
+outage; M6 added a real forecasting module (a `Forecaster` interface plus
+persistence and same-time-of-day-average baseline models) that now drives
+the dashboard's forecast panel, replacing its original inline placeholder;
+M7 added the real rolling-horizon economic dispatch engine — an LP that
+chooses the battery's and EV charger's schedules to minimize grid cost using
+those forecasts and the real tariff, replacing the original fixed
+self-consumption rule whenever the grid is available; M9 adds manual
+setpoint overrides to the dashboard's controls panel (battery/EV power, a
+water-heater force-on/off), routed through the same M5 protection gate as
+automated control, so an unsafe one is visibly rejected rather than silently
+dropped — see "Manual overrides" below.
+
+**M8 (real Modbus/SunSpec adapters) was deliberately done *after* M9**,
+reordered from the dev plan's default sequence — M9's override wiring
+doesn't depend on real adapters existing. Its per-device adapter selector is
+scoped down accordingly: every device currently reports as `"simulated"`
+with no working `"real"` option, ready for M8 to register one.
 
 ## Development setup
 
@@ -183,9 +193,37 @@ The forecast panel is backed by the real M6 forecasting module (see
 the real M7 dispatch engine's decision (whether it's active, the battery's
 setpoint, and its projected horizon cost), and the protection state card
 shows the real M5 state machine — no placeholders remain in the
-decision-variables panel as of M7.
+decision-variables panel as of M7. See "Manual overrides" below for M9's
+controls-panel additions.
 
 Options: `--host`, `--port`, `--telemetry-db`, `--step-seconds`.
+
+## Manual overrides (M9)
+
+The dashboard's "Manual overrides" controls-panel section lets you request a
+setpoint directly, instead of leaving it to dispatch/the automated fallback
+rule:
+
+- **Battery power (W)** — a signed setpoint (+ discharge / - charge).
+- **EV charger power (W)** — a charging-power setpoint.
+- **Water heater** — Auto / Force on / Force off, overriding its normal
+  hysteresis.
+
+Every override is routed through the same M5 protection gate as automated
+control — it's applied only while the site is grid-connected (`NORMAL`/
+`RESTORATION`); while islanded or black-starting, the resilience-first
+fallback rule keeps full authority and an override is **visibly rejected**
+rather than silently dropped. The "Manual overrides" decision card shows
+each device as `auto`, `<value> (applied)`, or `<value> (REJECTED by
+protection gate)` live, so disconnecting the grid toggle while an override
+is set is a quick way to see a rejection happen. Clear a battery/EV override
+with its "Clear" button, or set the water heater back to "Auto", to return
+that device to automatic control.
+
+The "Device adapters" panel below it lists every device's current adapter
+mode — `simulated` for all of them today, since M8's real Modbus/SunSpec
+adapters haven't landed yet; the panel (and its backing `GET /api/devices`
+endpoint) is the seam M8 will register a real option into.
 
 ## Forecasting
 

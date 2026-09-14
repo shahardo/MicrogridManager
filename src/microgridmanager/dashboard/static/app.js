@@ -53,6 +53,15 @@ function fmtPrice(price) {
   return `$${price.toFixed(3)}/kWh`;
 }
 
+// M9: describe one device's manual-override status from its row's
+// "*_override_active"/"*_override_applied" fields — active-but-not-applied
+// is a visible rejection by the protection gate, not a silently dropped
+// request.
+function describeOverride(active, applied, valueLabel) {
+  if (!active) return "auto";
+  return applied ? `${valueLabel} (applied)` : `${valueLabel} (REJECTED by protection gate)`;
+}
+
 function renderCards(row) {
   const deviceCards = document.getElementById("device-cards");
   const decisionCards = document.getElementById("decision-cards");
@@ -119,6 +128,32 @@ function renderCards(row) {
       ["Household load", row.household_load_served ? "served" : "shed"],
       ["Water heater", row.water_heater_served ? "served" : "shed"],
       ["EV charger", row.ev_charger_served ? "served" : "shed"],
+    ]),
+    card("Manual overrides (M9)", [
+      [
+        "Battery",
+        describeOverride(
+          row.battery_override_active,
+          row.battery_override_applied,
+          fmtW(row.battery_override_power_w),
+        ),
+      ],
+      [
+        "EV charger",
+        describeOverride(
+          row.ev_override_active,
+          row.ev_override_applied,
+          fmtW(row.ev_override_power_w),
+        ),
+      ],
+      [
+        "Water heater",
+        describeOverride(
+          row.water_heater_override_active,
+          row.water_heater_override_applied,
+          row.water_heater_override_heating ? "force on" : "force off",
+        ),
+      ],
     ]),
   ].join("");
 }
@@ -268,6 +303,28 @@ function renderCharts(rows) {
   );
 }
 
+// M9: per-device real/simulated adapter mode, fetched once — it doesn't
+// change tick to tick like the live state does. Every device reports
+// "simulated" with `available_modes: ["simulated"]` until M8 registers a
+// real adapter, so this renders as a plain label rather than a selector
+// that would offer a choice that doesn't actually work yet.
+async function loadDeviceAdapters() {
+  try {
+    const devices = await fetchJSON("/api/devices");
+    const container = document.getElementById("device-adapter-cards");
+    container.innerHTML = devices
+      .map((d) => {
+        const label = d.available_modes.includes("real")
+          ? d.adapter_mode
+          : `${d.adapter_mode} (real: available after M8)`;
+        return card(d.device, [["Adapter", label]]);
+      })
+      .join("");
+  } catch (err) {
+    console.error(err);
+  }
+}
+
 async function pollLive() {
   try {
     const [liveState, history] = await Promise.all([
@@ -392,9 +449,14 @@ document.getElementById("btn-start").addEventListener("click", () =>
 document.getElementById("btn-pause").addEventListener("click", () =>
   fetchJSON("/api/controls/pause", { method: "POST" }),
 );
-document.getElementById("btn-reset").addEventListener("click", () =>
-  fetchJSON("/api/controls/reset", { method: "POST" }),
-);
+document.getElementById("btn-reset").addEventListener("click", () => {
+  fetchJSON("/api/controls/reset", { method: "POST" });
+  // Reset clears the engine's overrides too (fresh run) — clear the input
+  // controls to match rather than leaving stale values displayed.
+  document.getElementById("battery-override-input").value = "";
+  document.getElementById("ev-override-input").value = "";
+  document.getElementById("water-heater-override-select").value = "auto";
+});
 document.getElementById("speed-input").addEventListener("change", (e) => {
   fetchJSON("/api/controls/speed", {
     method: "POST",
@@ -408,6 +470,41 @@ document.getElementById("grid-toggle").addEventListener("change", (e) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ connected: e.target.checked }),
   });
+});
+
+function postOverride(path, body) {
+  return fetchJSON(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+document.getElementById("battery-override-set").addEventListener("click", () => {
+  const input = document.getElementById("battery-override-input");
+  const power_w = parseFloat(input.value);
+  if (Number.isNaN(power_w)) return;
+  postOverride("/api/controls/override/battery", { power_w });
+});
+document.getElementById("battery-override-clear").addEventListener("click", () => {
+  document.getElementById("battery-override-input").value = "";
+  postOverride("/api/controls/override/battery", { power_w: null });
+});
+
+document.getElementById("ev-override-set").addEventListener("click", () => {
+  const input = document.getElementById("ev-override-input");
+  const power_w = parseFloat(input.value);
+  if (Number.isNaN(power_w)) return;
+  postOverride("/api/controls/override/ev_charger", { power_w });
+});
+document.getElementById("ev-override-clear").addEventListener("click", () => {
+  document.getElementById("ev-override-input").value = "";
+  postOverride("/api/controls/override/ev_charger", { power_w: null });
+});
+
+document.getElementById("water-heater-override-select").addEventListener("change", (e) => {
+  const forceHeating = { auto: null, on: true, off: false }[e.target.value];
+  postOverride("/api/controls/override/water_heater", { force_heating: forceHeating });
 });
 
 document.getElementById("replay-run-select").addEventListener("change", (e) => loadRun(e.target.value));
@@ -426,3 +523,4 @@ document.getElementById("replay-speed").addEventListener("change", (e) => {
 });
 
 switchMode("live");
+loadDeviceAdapters();

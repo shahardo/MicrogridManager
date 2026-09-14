@@ -28,6 +28,16 @@ grid to optimize against, so both fall back to the original resilience-first
 self-consumption rule (charge from surplus, discharge to cover shortfall,
 EV auto-charges within whatever protection allows) — dispatch and
 resilience are different jobs, not one engine wearing two hats.
+
+M9 adds `ManualOverrides`: an operator's requested battery/EV power setpoints
+and water-heater force-heating decision (from the dashboard's controls
+panel), applied on top of whichever of the above (dispatch or the fallback
+rule) would otherwise run — but only where `_override_allowed` says the
+protection gate currently permits it, so an override can never bypass M5's
+safety decisions; it can only act within whatever those decisions already
+allow. Every tick reports whether each override was active and whether it
+was actually applied, so a rejected override is visible rather than silently
+dropped (see the `*_override_*` row fields below).
 """
 
 from __future__ import annotations
@@ -56,6 +66,7 @@ from microgridmanager.dispatch import BatteryState, DispatchEngine, EVChargingSt
 from microgridmanager.protection import (
     PROTECTION_STATE_CODES,
     ProtectionController,
+    ProtectionDecision,
     SheddableLoad,
 )
 
@@ -74,6 +85,41 @@ EV_RATED_POWER_W = 7_200.0
 HOUSEHOLD_LOAD_PRIORITY = 0
 WATER_HEATER_PRIORITY = 1
 EV_CHARGER_PRIORITY = 2
+
+
+@dataclass(frozen=True)
+class ManualOverrides:
+    """One tick's pending operator overrides (M9), from the dashboard's
+    controls panel. `None` for a field means "no override, let dispatch/the
+    fallback rule decide as usual". A non-`None` value is applied only while
+    `_override_allowed` says the protection gate currently permits it for
+    that device — see the module docstring."""
+
+    battery_power_w: float | None = None
+    ev_power_w: float | None = None
+    water_heater_force_heating: bool | None = None
+
+
+def _override_allowed(decision: ProtectionDecision, served_key: str | None = None) -> bool:
+    """Whether a manual setpoint override may be applied this tick.
+
+    Only while the site is grid-connected (`NORMAL`/`RESTORATION` —
+    `decision.grid_exchange_allowed()`): while islanded or black-starting,
+    the resilience-first fallback rule has full authority over the
+    battery/EV/water heater to keep whatever critical loads it can powered,
+    and an operator's override must never be able to second-guess it — the
+    same "final gate" invariant M5 enforces against automated control
+    applies to manual control too. And, for a load that can be shed
+    (`served_key` — `None` for the battery, which isn't a `SheddableLoad`),
+    never while protection has actually shed it, even though that can't
+    currently happen in a grid-connected state — an override can act only
+    within what the safety gate already allows, never around it.
+    """
+    if not decision.grid_exchange_allowed():
+        return False
+    if served_key is not None and not decision.served.get(served_key, True):
+        return False
+    return True
 
 
 def grid_outage_between(outage_start: datetime, outage_end: datetime) -> Callable[[datetime], bool]:
@@ -235,6 +281,7 @@ def step_scenario(
     *,
     grid_connected: bool = True,
     dispatch_enabled: bool = True,
+    overrides: ManualOverrides | None = None,
 ) -> dict:
     """Advance one control step.
 
@@ -260,9 +307,18 @@ def step_scenario(
     otherwise the PCC is treated as physically open and carries zero power
     regardless of any residual imbalance.
 
+    `overrides` (M9) is applied at the exact point each device's setpoint
+    would otherwise be written — after dispatch/the fallback rule has
+    already decided what it *would* do, so an override always has a
+    well-defined automatic decision to fall back to when the protection gate
+    rejects it (`_override_allowed`), rather than needing a separate pass
+    that could race this tick's protection decision.
+
     Returns a flat dict of this step's readings, the visible per-tick record
     every later milestone (and the M4 dashboard) reads.
     """
+    overrides = overrides or ManualOverrides()
+
     # Clear any override a previous tick's shed left in place *before*
     # reading demand: household_load's own get_state() reflects the override
     # if one is set, so reading it first would see the last tick's forced 0 W
@@ -315,9 +371,24 @@ def step_scenario(
         assets.household_load.set_active_power_w(0.0)
         household_state = assets.household_load.get_state()
 
-    assets.water_heater.set_shed(not decision.served["water_heater"])
+    # M9: an active water-heater override is applied on top of the shed
+    # decision above — but `set_shed` (just called) always wins inside the
+    # adapter regardless, so gating on `_override_allowed` here exists to
+    # report the override as rejected, not to prevent an unsafe write.
+    water_heater_override_active = overrides.water_heater_force_heating is not None
+    water_heater_override_applied = water_heater_override_active and _override_allowed(
+        decision, "water_heater"
+    )
+    assets.water_heater.set_manual_heating_override(
+        overrides.water_heater_force_heating if water_heater_override_applied else None
+    )
     assets.water_heater.step(dt_seconds)
     water_heater_state = assets.water_heater.get_state()
+
+    ev_override_active = overrides.ev_power_w is not None
+    ev_override_applied = ev_override_active and _override_allowed(decision, "ev_charger")
+    battery_override_active = overrides.battery_power_w is not None
+    battery_override_applied = battery_override_active and _override_allowed(decision)
 
     dispatch_active = dispatch_enabled and decision.grid_exchange_allowed()
     dispatch_projected_cost = 0.0
@@ -345,18 +416,26 @@ def step_scenario(
         )
         dispatch_projected_cost = plan.projected_cost
 
-        assets.ev_charger.set_active_power_w(plan.ev_setpoint_w or 0.0)
+        if ev_override_applied:
+            assets.ev_charger.set_active_power_w(overrides.ev_power_w)
+        else:
+            assets.ev_charger.set_active_power_w(plan.ev_setpoint_w or 0.0)
         assets.ev_charger.step(dt_seconds)
         ev_state = assets.ev_charger.get_state()
 
         # plan.battery_setpoint_w already uses the same sign convention as
         # the adapter (+ = discharge, - = charge) — see DispatchPlan's
         # docstring — so it's applied directly, not negated.
-        assets.battery.set_active_power_w(plan.battery_setpoint_w)
+        if battery_override_applied:
+            assets.battery.set_active_power_w(overrides.battery_power_w)
+        else:
+            assets.battery.set_active_power_w(plan.battery_setpoint_w)
         assets.battery.step(dt_seconds)
         battery_state = assets.battery.get_state()
     else:
-        if decision.served["ev_charger"]:
+        if ev_override_applied:
+            assets.ev_charger.set_active_power_w(overrides.ev_power_w)
+        elif decision.served["ev_charger"]:
             assets.ev_charger.clear_override()
         else:
             assets.ev_charger.set_active_power_w(0.0)
@@ -369,7 +448,10 @@ def step_scenario(
             + water_heater_state.active_power_w
         )
         net_surplus_w = pv_state.active_power_w - uncontrolled_load_w
-        assets.battery.set_active_power_w(-net_surplus_w)
+        if battery_override_applied:
+            assets.battery.set_active_power_w(overrides.battery_power_w)
+        else:
+            assets.battery.set_active_power_w(-net_surplus_w)
         assets.battery.step(dt_seconds)
         battery_state = assets.battery.get_state()
 
@@ -415,6 +497,20 @@ def step_scenario(
         "protection_state": float(PROTECTION_STATE_CODES[decision.state]),
         "dispatch_active": float(dispatch_active),
         "dispatch_projected_cost_usd": dispatch_projected_cost,
+        # M9 manual overrides: "*_active" is whether an override was pending
+        # this tick at all (regardless of outcome), "*_applied" is whether
+        # the protection gate actually let it through — active-but-not-
+        # applied is a visibly rejected override. The requested value fields
+        # are only meaningful while "*_active" is set.
+        "battery_override_active": float(battery_override_active),
+        "battery_override_power_w": overrides.battery_power_w or 0.0,
+        "battery_override_applied": float(battery_override_applied),
+        "ev_override_active": float(ev_override_active),
+        "ev_override_power_w": overrides.ev_power_w or 0.0,
+        "ev_override_applied": float(ev_override_applied),
+        "water_heater_override_active": float(water_heater_override_active),
+        "water_heater_override_heating": float(overrides.water_heater_force_heating or False),
+        "water_heater_override_applied": float(water_heater_override_applied),
     }
 
 
@@ -425,6 +521,7 @@ def run(
     start: datetime | None = None,
     grid_connected_at: Callable[[datetime], bool] | None = None,
     dispatch_enabled: bool = True,
+    overrides: ManualOverrides | None = None,
 ) -> list[dict]:
     """Run the scenario. `grid_connected_at`, if given, is evaluated against
     the clock each tick to drive the M5 protection state machine — e.g.
@@ -434,7 +531,12 @@ def run(
     `dispatch_enabled=False` (M7) reverts to the original fixed
     self-consumption rule for the battery/EV even while grid-connected — the
     "naive baseline" `simulation/dispatch_report.py` compares the real
-    dispatch engine against."""
+    dispatch engine against.
+
+    `overrides` (M9), if given, is applied identically every tick — a batch
+    run has no live operator changing their mind mid-run, so this is mostly
+    useful for scenario tests exercising the override gating without driving
+    `step_scenario` tick-by-tick themselves."""
     assets = build_scenario(start=start, step_seconds=step_seconds)
     num_steps = int(duration_hours * 3600.0 / step_seconds)
     grid_connected_at = grid_connected_at or (lambda _now: True)
@@ -448,6 +550,7 @@ def run(
                 step_seconds,
                 grid_connected=grid_connected,
                 dispatch_enabled=dispatch_enabled,
+                overrides=overrides,
             )
         )
         assets.clock.tick()

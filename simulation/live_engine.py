@@ -22,12 +22,25 @@ series) instead of the M4 dashboard's inline `persistence_forecast`
 placeholder — the dashboard's forecast panel and chart read the same
 `pv_power_forecast_w`/`household_load_power_forecast_w` fields either way, so
 this swap needed no panel changes.
+
+M9 adds the controls panel's manual override setters
+(`set_battery_override`/`set_ev_override`/`set_water_heater_override`): each
+just stashes the requested value on `self._overrides`, a
+`household_day.ManualOverrides`, which `tick()` passes into `step_scenario`
+every tick from then on — the actual safety gating (whether an override is
+allowed to take effect this tick) lives entirely in `household_day`'s
+`_override_allowed`, not here, so this engine stays a thin driver. It also
+adds `device_adapter_modes()`: every device is `"simulated"`-only until M8
+lands a real Modbus/SunSpec adapter and registers it as a second available
+mode here — this method is the seam M8 extends, not a working real/simulated
+switch on its own yet.
 """
 
 from __future__ import annotations
 
 import itertools
 from collections import deque
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from microgridmanager.forecasting import HistoricalPoint, SeasonalAverageForecaster
@@ -36,6 +49,11 @@ from simulation.scenarios import household_day
 
 DEFAULT_STEP_SECONDS = 300.0
 DEFAULT_HISTORY_LENGTH = 500
+
+# Every controllable device this scenario wires up, for `device_adapter_modes`
+# (M9) — mirrors `HouseholdScenarioAssets`' fields, minus the non-device
+# `clock`/`protection`/`dispatch` entries.
+DEVICE_IDS = ("pv", "battery", "household_load", "ev_charger", "water_heater", "grid")
 
 # One forecaster per series: "same time of day, averaged over the last week"
 # — a meaningfully better baseline than persistence for this scenario's daily-
@@ -82,6 +100,7 @@ class SimulationEngine:
         self.history: deque[dict] = deque(maxlen=self._history_length)
         self._pv_history: deque[HistoricalPoint] = deque(maxlen=self._forecast_history_length)
         self._load_history: deque[HistoricalPoint] = deque(maxlen=self._forecast_history_length)
+        self._overrides = household_day.ManualOverrides()
         run_number = next(self._run_counter)
         started_at = datetime.now(timezone.utc)
         self.run_id = f"live-{run_number}-{started_at:%Y%m%dT%H%M%SZ}"
@@ -108,6 +127,37 @@ class SimulationEngine:
         sheds loads by priority, and can drive a black start."""
         self.grid_connected = connected
 
+    def set_battery_override(self, power_w: float | None) -> None:
+        """M9 manual override: request the battery hold `power_w` (+ =
+        discharge, - = charge) instead of whatever dispatch/the fallback
+        rule would choose. `None` clears it, reverting to automatic control.
+        Sticky across ticks until cleared or replaced; whether it's actually
+        applied each tick is decided by `household_day`'s protection gate
+        and reported back in that tick's row (`battery_override_applied`)."""
+        self._overrides = replace(self._overrides, battery_power_w=power_w)
+
+    def set_ev_override(self, power_w: float | None) -> None:
+        """M9 manual override: request the EV charger draw `power_w` instead
+        of dispatch/the auto-charge rule. `None` clears it. See
+        `set_battery_override` for the applied-vs-rejected reporting."""
+        self._overrides = replace(self._overrides, ev_power_w=power_w)
+
+    def set_water_heater_override(self, force_heating: bool | None) -> None:
+        """M9 manual override: force the water heater's element on (`True`)
+        or off (`False`) regardless of hysteresis, or clear the override
+        (`None`) to release it back to automatic control. See
+        `set_battery_override` for the applied-vs-rejected reporting."""
+        self._overrides = replace(self._overrides, water_heater_force_heating=force_heating)
+
+    def device_adapter_modes(self) -> list[dict[str, object]]:
+        """Per-device real/simulated adapter selector (M9): every device is
+        `"simulated"`-only until M8 lands a real adapter and registers it as
+        a second available mode here — see this module's docstring."""
+        return [
+            {"device": device_id, "adapter_mode": "simulated", "available_modes": ["simulated"]}
+            for device_id in DEVICE_IDS
+        ]
+
     def tick(self) -> dict:
         """Advance one control step and return this step's reading (the same
         row shape `household_day.step_scenario` produces — including its
@@ -115,7 +165,10 @@ class SimulationEngine:
         `dispatch_projected_cost_usd` fields — plus a couple of small
         dashboard-only derived/duplicate fields added below)."""
         row = household_day.step_scenario(
-            self.assets, self._step_seconds, grid_connected=self.grid_connected
+            self.assets,
+            self._step_seconds,
+            grid_connected=self.grid_connected,
+            overrides=self._overrides,
         )
         timestamp = datetime.fromisoformat(row["timestamp"])
 
