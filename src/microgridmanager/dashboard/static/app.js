@@ -14,6 +14,8 @@ const PROTECTION_STATE_LABELS = {
 const state = {
   mode: "live",
   liveTimer: null,
+  chartView: "line",
+  lastChartRows: [],
   replay: {
     rows: [],
     index: 0,
@@ -133,6 +135,45 @@ function seriesFromRows(rows, key, label, color) {
   };
 }
 
+// Shared by both chart styles: left/bottom axis lines, horizontal gridlines
+// and their labels. Takes pre-computed yScale bounds so it has no opinion on
+// how those bounds were derived (plain min/max for line charts, stacked
+// totals for area charts).
+function drawAxes(ctx, { padding, plotW, plotH, yMin, yMax, yFormat }) {
+  ctx.strokeStyle = "#cbd5e1";
+  ctx.beginPath();
+  ctx.moveTo(padding.left, padding.top);
+  ctx.lineTo(padding.left, padding.top + plotH);
+  ctx.lineTo(padding.left + plotW, padding.top + plotH);
+  ctx.stroke();
+
+  ctx.fillStyle = "#94a3b8";
+  ctx.font = "10px system-ui";
+  for (let i = 0; i <= 4; i++) {
+    const y = yMin + (yMax - yMin) * (i / 4);
+    const py = padding.top + plotH - ((y - yMin) / (yMax - yMin || 1)) * plotH;
+    const label = yFormat ? yFormat(y) : y.toFixed(2);
+    ctx.fillText(label, 2, py + 3);
+    ctx.strokeStyle = "#eef2f6";
+    ctx.beginPath();
+    ctx.moveTo(padding.left, py);
+    ctx.lineTo(padding.left + plotW, py);
+    ctx.stroke();
+  }
+}
+
+function drawLegend(ctx, padding, seriesList) {
+  let lx = padding.left + 4;
+  ctx.font = "11px system-ui";
+  seriesList.forEach((s) => {
+    ctx.fillStyle = s.color;
+    ctx.fillRect(lx, 4, 8, 8);
+    ctx.fillStyle = "#334155";
+    ctx.fillText(s.label, lx + 11, 12);
+    lx += ctx.measureText(s.label).width + 30;
+  });
+}
+
 function drawLineChart(canvas, seriesList, opts = {}) {
   const ctx = canvas.getContext("2d");
   const width = canvas.width;
@@ -171,26 +212,7 @@ function drawLineChart(canvas, seriesList, opts = {}) {
   const xScale = (t) => padding.left + ((t - xMin) / (xMax - xMin || 1)) * plotW;
   const yScale = (y) => padding.top + plotH - ((y - yMin) / (yMax - yMin || 1)) * plotH;
 
-  ctx.strokeStyle = "#cbd5e1";
-  ctx.beginPath();
-  ctx.moveTo(padding.left, padding.top);
-  ctx.lineTo(padding.left, padding.top + plotH);
-  ctx.lineTo(padding.left + plotW, padding.top + plotH);
-  ctx.stroke();
-
-  ctx.fillStyle = "#94a3b8";
-  ctx.font = "10px system-ui";
-  for (let i = 0; i <= 4; i++) {
-    const y = yMin + (yMax - yMin) * (i / 4);
-    const py = yScale(y);
-    const label = opts.yFormat ? opts.yFormat(y) : y.toFixed(2);
-    ctx.fillText(label, 2, py + 3);
-    ctx.strokeStyle = "#eef2f6";
-    ctx.beginPath();
-    ctx.moveTo(padding.left, py);
-    ctx.lineTo(padding.left + plotW, py);
-    ctx.stroke();
-  }
+  drawAxes(ctx, { padding, plotW, plotH, yMin, yMax, yFormat: opts.yFormat });
 
   plottable.forEach((s) => {
     ctx.strokeStyle = s.color;
@@ -208,64 +230,176 @@ function drawLineChart(canvas, seriesList, opts = {}) {
     ctx.stroke();
   });
 
-  let lx = padding.left + 4;
-  ctx.font = "11px system-ui";
-  plottable.forEach((s) => {
-    ctx.fillStyle = s.color;
-    ctx.fillRect(lx, 4, 8, 8);
-    ctx.fillStyle = "#334155";
-    ctx.fillText(s.label, lx + 11, 12);
-    lx += ctx.measureText(s.label).width + 30;
-  });
+  drawLegend(ctx, padding, plottable);
 }
+
+// Same series/opts shape as drawLineChart, but reads straight from `rows`
+// (rather than pre-filtered per-series points) since every band needs
+// values aligned at the same x position to stack correctly; a missing
+// reading is treated as 0 contribution for that tick.
+function drawStackedAreaChart(canvas, rows, seriesDefs, opts = {}) {
+  const ctx = canvas.getContext("2d");
+  const width = canvas.width;
+  const height = canvas.height;
+  ctx.clearRect(0, 0, width, height);
+
+  const padding = { left: 55, right: 10, top: 18, bottom: 24 };
+  const plotW = width - padding.left - padding.right;
+  const plotH = height - padding.top - padding.bottom;
+
+  const points = rows
+    .filter((r) => r.timestamp !== undefined && r.timestamp !== null)
+    .map((r) => ({
+      t: new Date(r.timestamp).getTime(),
+      values: seriesDefs.map((s) => (r[s.key] === undefined || r[s.key] === null ? 0 : r[s.key])),
+    }));
+
+  if (points.length < 2) {
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "12px system-ui";
+    ctx.fillText("Not enough data yet", padding.left, height / 2);
+    return;
+  }
+
+  let yMinAll = 0;
+  let yMaxAll = 0;
+  const stacks = points.map((p) => {
+    let base = 0;
+    return p.values.map((v) => {
+      const y0 = base;
+      const y1 = base + v;
+      base = y1;
+      yMinAll = Math.min(yMinAll, y0, y1);
+      yMaxAll = Math.max(yMaxAll, y0, y1);
+      return [y0, y1];
+    });
+  });
+
+  let yMin = opts.yMin ?? yMinAll;
+  let yMax = opts.yMax ?? yMaxAll;
+  if (yMax - yMin < 1e-9) {
+    yMax += 1;
+    yMin -= 1;
+  }
+  if (opts.yMin === undefined && opts.yMax === undefined) {
+    const pad = (yMax - yMin) * 0.1;
+    yMin -= pad;
+    yMax += pad;
+  }
+
+  const ts = points.map((p) => p.t);
+  const xMin = Math.min(...ts);
+  const xMax = Math.max(...ts);
+  const xScale = (t) => padding.left + ((t - xMin) / (xMax - xMin || 1)) * plotW;
+  const yScale = (y) => padding.top + plotH - ((y - yMin) / (yMax - yMin || 1)) * plotH;
+
+  drawAxes(ctx, { padding, plotW, plotH, yMin, yMax, yFormat: opts.yFormat });
+
+  seriesDefs.forEach((s, idx) => {
+    ctx.beginPath();
+    points.forEach((p, i) => {
+      const x = xScale(p.t);
+      const y = yScale(stacks[i][idx][1]);
+      if (i === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
+    });
+    for (let i = points.length - 1; i >= 0; i--) {
+      const x = xScale(points[i].t);
+      const y = yScale(stacks[i][idx][0]);
+      ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = `${s.color}b3`;
+    ctx.fill();
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    points.forEach((p, i) => {
+      const x = xScale(p.t);
+      const y = yScale(stacks[i][idx][1]);
+      if (i === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
+    });
+    ctx.stroke();
+  });
+
+  drawLegend(ctx, padding, seriesDefs);
+}
+
+const CHART_CONFIGS = [
+  {
+    id: "chart-power",
+    series: [
+      { key: "pv_power_w", label: "PV", color: COLORS[0] },
+      { key: "battery_power_w", label: "Battery", color: COLORS[1] },
+      { key: "household_load_power_w", label: "Household", color: COLORS[2] },
+      { key: "ev_power_w", label: "EV", color: COLORS[3] },
+      { key: "water_heater_power_w", label: "Water heater", color: COLORS[4] },
+      { key: "grid_power_w", label: "Grid", color: COLORS[5] },
+    ],
+    opts: {},
+  },
+  {
+    id: "chart-levels",
+    series: [
+      { key: "battery_soc", label: "Battery SoC", color: COLORS[1] },
+      { key: "ev_soc", label: "EV SoC", color: COLORS[3] },
+      { key: "ev_target_soc", label: "EV target", color: "#c4b5fd" },
+      { key: "water_heater_tank_fraction", label: "Water tank", color: COLORS[4] },
+    ],
+    opts: { yMin: 0, yMax: 1, yFormat: (y) => `${Math.round(y * 100)}%` },
+  },
+  {
+    id: "chart-price",
+    series: [
+      { key: "grid_import_price_per_kwh", label: "Import $/kWh", color: COLORS[2] },
+      { key: "grid_export_price_per_kwh", label: "Export $/kWh", color: COLORS[5] },
+    ],
+    opts: {},
+  },
+  {
+    id: "chart-protection",
+    series: [
+      { key: "protection_state", label: "State (0=normal..4=restoration)", color: COLORS[6] },
+      { key: "household_load_served", label: "Household served", color: COLORS[2] },
+      { key: "water_heater_served", label: "Water heater served", color: COLORS[4] },
+      { key: "ev_charger_served", label: "EV served", color: COLORS[3] },
+    ],
+    opts: { yMin: 0, yMax: 4 },
+  },
+  {
+    id: "chart-forecast",
+    series: [
+      { key: "pv_power_w", label: "PV actual", color: COLORS[0] },
+      { key: "pv_power_forecast_w", label: "PV forecast", color: "#93c5fd" },
+      { key: "household_load_power_w", label: "Load actual", color: COLORS[2] },
+      { key: "household_load_power_forecast_w", label: "Load forecast", color: "#fca5a5" },
+    ],
+    opts: {},
+  },
+];
 
 function renderCharts(rows) {
   if (!rows || rows.length === 0) {
     return;
   }
+  state.lastChartRows = rows;
 
-  drawLineChart(document.getElementById("chart-power"), [
-    seriesFromRows(rows, "pv_power_w", "PV", COLORS[0]),
-    seriesFromRows(rows, "battery_power_w", "Battery", COLORS[1]),
-    seriesFromRows(rows, "household_load_power_w", "Household", COLORS[2]),
-    seriesFromRows(rows, "ev_power_w", "EV", COLORS[3]),
-    seriesFromRows(rows, "water_heater_power_w", "Water heater", COLORS[4]),
-    seriesFromRows(rows, "grid_power_w", "Grid", COLORS[5]),
-  ]);
-
-  drawLineChart(
-    document.getElementById("chart-levels"),
-    [
-      seriesFromRows(rows, "battery_soc", "Battery SoC", COLORS[1]),
-      seriesFromRows(rows, "ev_soc", "EV SoC", COLORS[3]),
-      seriesFromRows(rows, "ev_target_soc", "EV target", "#c4b5fd"),
-      seriesFromRows(rows, "water_heater_tank_fraction", "Water tank", COLORS[4]),
-    ],
-    { yMin: 0, yMax: 1, yFormat: (y) => `${Math.round(y * 100)}%` },
-  );
-
-  drawLineChart(document.getElementById("chart-price"), [
-    seriesFromRows(rows, "grid_import_price_per_kwh", "Import $/kWh", COLORS[2]),
-    seriesFromRows(rows, "grid_export_price_per_kwh", "Export $/kWh", COLORS[5]),
-  ]);
-
-  drawLineChart(document.getElementById("chart-forecast"), [
-    seriesFromRows(rows, "pv_power_w", "PV actual", COLORS[0]),
-    seriesFromRows(rows, "pv_power_forecast_w", "PV forecast", "#93c5fd"),
-    seriesFromRows(rows, "household_load_power_w", "Load actual", COLORS[2]),
-    seriesFromRows(rows, "household_load_power_forecast_w", "Load forecast", "#fca5a5"),
-  ]);
-
-  drawLineChart(
-    document.getElementById("chart-protection"),
-    [
-      seriesFromRows(rows, "protection_state", "State (0=normal..4=restoration)", COLORS[6]),
-      seriesFromRows(rows, "household_load_served", "Household served", COLORS[2]),
-      seriesFromRows(rows, "water_heater_served", "Water heater served", COLORS[4]),
-      seriesFromRows(rows, "ev_charger_served", "EV served", COLORS[3]),
-    ],
-    { yMin: 0, yMax: 4 },
-  );
+  CHART_CONFIGS.forEach((cfg) => {
+    const canvas = document.getElementById(cfg.id);
+    if (state.chartView === "stacked") {
+      drawStackedAreaChart(canvas, rows, cfg.series, cfg.opts);
+    } else {
+      const seriesList = cfg.series.map((s) => seriesFromRows(rows, s.key, s.label, s.color));
+      drawLineChart(canvas, seriesList, cfg.opts);
+    }
+  });
 }
 
 async function pollLive() {
@@ -408,6 +542,11 @@ document.getElementById("grid-toggle").addEventListener("change", (e) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ connected: e.target.checked }),
   });
+});
+
+document.getElementById("chart-view-select").addEventListener("change", (e) => {
+  state.chartView = e.target.value;
+  renderCharts(state.lastChartRows);
 });
 
 document.getElementById("replay-run-select").addEventListener("change", (e) => loadRun(e.target.value));

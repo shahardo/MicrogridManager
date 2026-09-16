@@ -417,7 +417,21 @@ simulation.
   series array position-for-position (`reconstructRows`), and scrubs through
   them client-side (play/pause/seek/speed) reusing the same card/chart
   renderers as the live view — proven to reproduce the live data exactly by
-  `tests/unit/dashboard/test_replay.py`.
+  `tests/unit/dashboard/test_replay.py`. All 5 charts live in one compact
+  "Charts" panel (`static/index.html`'s `.charts-grid`, a responsive CSS
+  grid so they wrap to fewer columns on narrow viewports) instead of one
+  full-width panel per chart, so the whole dashboard — controls, device/
+  decision cards, and every chart — fits in a single screen view without
+  scrolling on a typical desktop viewport. A "View" dropdown
+  (`#chart-view-select` in `static/app.js`) toggles every chart between the
+  original line rendering (`drawLineChart`) and a stacked-area rendering
+  (`drawStackedAreaChart` — same series/opts shape, but reads straight from
+  the row array so every band stacks off aligned x-positions, treating a
+  missing reading as 0 for that tick); both share `drawAxes`/`drawLegend`
+  helpers so the two renderers stay visually consistent. `CHART_CONFIGS`
+  is the single source of truth for each chart's series/keys/colors/opts —
+  add a new chart there rather than writing a new draw call, and both view
+  modes pick it up automatically.
 - `scripts/query_telemetry.py` — **M3's visible result**: CLI over the
   telemetry store. No `--run-id` lists runs; `--run-id` alone lists that
   run's series; `--run-id` + `--series` (optionally + `--asset-id`) prints

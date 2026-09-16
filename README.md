@@ -178,6 +178,11 @@ e.g. `uv run python scripts/query_telemetry.py --run-id <run> --series pv_power_
   `make run-scenario` or a previous live session) and lets you play/pause/
   seek/speed through it using the same device cards and charts.
 
+All charts sit together in one compact grid so the whole dashboard fits in
+a single screen view, and a "View" dropdown above the charts switches every
+chart between the default line rendering and a stacked-area rendering — the
+same toggle works in both Live and Replay mode.
+
 The forecast panel is backed by the real M6 forecasting module (see
 "Forecasting" below), the "Economic dispatch" decision-variables card shows
 the real M7 dispatch engine's decision (whether it's active, the battery's

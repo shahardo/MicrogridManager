@@ -59,8 +59,8 @@ body {
 }
 
 .panel {
-  margin: 14px 20px;
-  padding: 14px 16px;
+  margin: 10px 20px;
+  padding: 10px 16px;
   background: var(--panel-bg);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -132,6 +132,47 @@ body {
 
 .card .metric .value {
   font-weight: 600;
+}
+
+.charts-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.charts-header h2 {
+  margin: 0;
+}
+
+.chart-view-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.chart-view-toggle select {
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  color: var(--text);
+}
+
+.charts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.chart-box h3 {
+  margin: 0 0 4px 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
 }
 
 canvas {

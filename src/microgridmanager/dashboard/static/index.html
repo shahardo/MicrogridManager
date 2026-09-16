@@ -55,28 +55,37 @@
   </section>
 
   <section class="panel">
-    <h2>Power (W)</h2>
-    <canvas id="chart-power" width="900" height="260"></canvas>
-  </section>
-
-  <section class="panel">
-    <h2>Storage levels (0-1)</h2>
-    <canvas id="chart-levels" width="900" height="220"></canvas>
-  </section>
-
-  <section class="panel">
-    <h2>Grid tariff ($/kWh)</h2>
-    <canvas id="chart-price" width="900" height="220"></canvas>
-  </section>
-
-  <section class="panel">
-    <h2>Protection state (M5) &amp; load shedding</h2>
-    <canvas id="chart-protection" width="900" height="180"></canvas>
-  </section>
-
-  <section class="panel">
-    <h2>Forecast vs actual (placeholder persistence model, M6 replaces this)</h2>
-    <canvas id="chart-forecast" width="900" height="220"></canvas>
+    <div class="charts-header">
+      <h2>Charts</h2>
+      <label class="chart-view-toggle">View
+        <select id="chart-view-select">
+          <option value="line">Line</option>
+          <option value="stacked">Stacked area</option>
+        </select>
+      </label>
+    </div>
+    <div class="charts-grid">
+      <div class="chart-box">
+        <h3>Power (W)</h3>
+        <canvas id="chart-power" width="480" height="190"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>Storage levels (0-1)</h3>
+        <canvas id="chart-levels" width="480" height="190"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>Grid tariff ($/kWh)</h3>
+        <canvas id="chart-price" width="480" height="190"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>Protection state (M5) &amp; load shedding</h3>
+        <canvas id="chart-protection" width="480" height="190"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>Forecast vs actual</h3>
+        <canvas id="chart-forecast" width="480" height="190"></canvas>
+      </div>
+    </div>
   </section>
 
   <script src="/static/app.js"></script>
