@@ -22,12 +22,40 @@ series) instead of the M4 dashboard's inline `persistence_forecast`
 placeholder — the dashboard's forecast panel and chart read the same
 `pv_power_forecast_w`/`household_load_power_forecast_w` fields either way, so
 this swap needed no panel changes.
+
+M9 adds the controls panel's manual override setters
+(`set_battery_override`/`set_ev_override`/`set_water_heater_override`): each
+just stashes the requested value on `self._overrides`, a
+`household_day.ManualOverrides`, which `tick()` passes into `step_scenario`
+every tick from then on — the actual safety gating (whether an override is
+allowed to take effect this tick) lives entirely in `household_day`'s
+`_override_allowed`, not here, so this engine stays a thin driver. It also
+adds `device_adapter_modes()`: every device is `"simulated"`-only until M8
+lands a real Modbus/SunSpec adapter and registers it as a second available
+mode here — this method is the seam M8 extends, not a working real/simulated
+switch on its own yet.
+
+Post-M9 adds the "simulation disturbances" controls panel: `set_load_
+disturbance`/`set_pv_disturbance`/`set_demand_response`, each stashing a
+value + expiry on `self._disturbances`, a `household_day.
+ScenarioDisturbances`, mirroring the overrides pattern above — the actual
+effect (perturbing demand/PV/the grid-import cap) lives in `household_day.
+step_scenario`, not here. `trigger_outage(duration_minutes)` is the one
+disturbance that does *not* go through `ScenarioDisturbances`: it just
+reuses the existing `grid_connected` toggle (the same one the M4 controls
+panel already drives) and this engine tracks its own expiry
+(`self._outage_until`), checked at the top of every `tick()`, so the grid
+comes back automatically without a live operator having to remember to
+re-toggle it — a third mechanism alongside `grid_connected_at` (batch) and
+`grid_outage_between` (batch) would be redundant, so this is deliberately
+just a timed convenience over the same boolean.
 """
 
 from __future__ import annotations
 
 import itertools
 from collections import deque
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from microgridmanager.forecasting import HistoricalPoint, SeasonalAverageForecaster
@@ -36,6 +64,11 @@ from simulation.scenarios import household_day
 
 DEFAULT_STEP_SECONDS = 300.0
 DEFAULT_HISTORY_LENGTH = 500
+
+# Every controllable device this scenario wires up, for `device_adapter_modes`
+# (M9) — mirrors `HouseholdScenarioAssets`' fields, minus the non-device
+# `clock`/`protection`/`dispatch` entries.
+DEVICE_IDS = ("pv", "battery", "household_load", "ev_charger", "water_heater", "grid")
 
 # One forecaster per series: "same time of day, averaged over the last week"
 # — a meaningfully better baseline than persistence for this scenario's daily-
@@ -82,6 +115,9 @@ class SimulationEngine:
         self.history: deque[dict] = deque(maxlen=self._history_length)
         self._pv_history: deque[HistoricalPoint] = deque(maxlen=self._forecast_history_length)
         self._load_history: deque[HistoricalPoint] = deque(maxlen=self._forecast_history_length)
+        self._overrides = household_day.ManualOverrides()
+        self._disturbances = household_day.ScenarioDisturbances()
+        self._outage_until: datetime | None = None
         run_number = next(self._run_counter)
         started_at = datetime.now(timezone.utc)
         self.run_id = f"live-{run_number}-{started_at:%Y%m%dT%H%M%SZ}"
@@ -108,15 +144,115 @@ class SimulationEngine:
         sheds loads by priority, and can drive a black start."""
         self.grid_connected = connected
 
+    def set_battery_override(self, power_w: float | None) -> None:
+        """M9 manual override: request the battery hold `power_w` (+ =
+        discharge, - = charge) instead of whatever dispatch/the fallback
+        rule would choose. `None` clears it, reverting to automatic control.
+        Sticky across ticks until cleared or replaced; whether it's actually
+        applied each tick is decided by `household_day`'s protection gate
+        and reported back in that tick's row (`battery_override_applied`)."""
+        self._overrides = replace(self._overrides, battery_power_w=power_w)
+
+    def set_ev_override(self, power_w: float | None) -> None:
+        """M9 manual override: request the EV charger draw `power_w` instead
+        of dispatch/the auto-charge rule. `None` clears it. See
+        `set_battery_override` for the applied-vs-rejected reporting."""
+        self._overrides = replace(self._overrides, ev_power_w=power_w)
+
+    def set_water_heater_override(self, force_heating: bool | None) -> None:
+        """M9 manual override: force the water heater's element on (`True`)
+        or off (`False`) regardless of hysteresis, or clear the override
+        (`None`) to release it back to automatic control. See
+        `set_battery_override` for the applied-vs-rejected reporting."""
+        self._overrides = replace(self._overrides, water_heater_force_heating=force_heating)
+
+    def trigger_outage(self, duration_minutes: float | None) -> None:
+        """Simulation disturbance: force the grid disconnected for
+        `duration_minutes` from now, then automatically reconnect. `None`
+        (or a non-positive duration) clears a pending outage and reconnects
+        immediately — this is the one manual override the operator still has
+        on top of it: toggling `grid_connected` directly (the M4/M5 control)
+        at any time overrides whatever this method last set, and a
+        currently-running timed outage doesn't fight back."""
+        if duration_minutes is None or duration_minutes <= 0:
+            self._outage_until = None
+            self.grid_connected = True
+            return
+        self._outage_until = self.assets.clock.now + timedelta(minutes=duration_minutes)
+        self.grid_connected = False
+
+    def set_load_disturbance(
+        self, multiplier: float | None, duration_minutes: float | None
+    ) -> None:
+        """Simulation disturbance: scale household demand by `multiplier`
+        (e.g. 1.5 for "high demand", 0.5 for "low demand") for
+        `duration_minutes`, or indefinitely if `None`. `multiplier=None`
+        clears it. See `household_day.ScenarioDisturbances`."""
+        until = self._disturbance_until(duration_minutes) if multiplier is not None else None
+        self._disturbances = replace(
+            self._disturbances, load_multiplier=multiplier, load_multiplier_until=until
+        )
+
+    def set_pv_disturbance(self, multiplier: float | None, duration_minutes: float | None) -> None:
+        """Simulation disturbance ("clouds"): scale PV output by
+        `multiplier` (e.g. 0.2 for heavy cloud cover) for
+        `duration_minutes`, or indefinitely if `None`. `multiplier=None`
+        clears it. See `household_day.ScenarioDisturbances`."""
+        until = self._disturbance_until(duration_minutes) if multiplier is not None else None
+        self._disturbances = replace(
+            self._disturbances, pv_multiplier=multiplier, pv_multiplier_until=until
+        )
+
+    def set_demand_response(
+        self, max_import_w: float | None, duration_minutes: float | None
+    ) -> None:
+        """Simulation disturbance: cap grid import at `max_import_w` (a
+        utility demand-response event) for `duration_minutes`, or
+        indefinitely if `None`. `max_import_w=None` clears it. Only takes
+        effect while dispatch is actively running (grid-connected, not
+        islanded/black-starting, `dispatch_enabled`) — see
+        `household_day.ScenarioDisturbances`."""
+        until = self._disturbance_until(duration_minutes) if max_import_w is not None else None
+        self._disturbances = replace(
+            self._disturbances, max_import_w=max_import_w, max_import_w_until=until
+        )
+
+    def _disturbance_until(self, duration_minutes: float | None) -> datetime | None:
+        if duration_minutes is None or duration_minutes <= 0:
+            return None
+        return self.assets.clock.now + timedelta(minutes=duration_minutes)
+
+    def device_adapter_modes(self) -> list[dict[str, object]]:
+        """Per-device real/simulated adapter selector (M9): every device is
+        `"simulated"`-only until M8 lands a real adapter and registers it as
+        a second available mode here — see this module's docstring."""
+        return [
+            {"device": device_id, "adapter_mode": "simulated", "available_modes": ["simulated"]}
+            for device_id in DEVICE_IDS
+        ]
+
     def tick(self) -> dict:
         """Advance one control step and return this step's reading (the same
         row shape `household_day.step_scenario` produces — including its
         real `protection_state`/`*_served`/`dispatch_active`/
         `dispatch_projected_cost_usd` fields — plus a couple of small
         dashboard-only derived/duplicate fields added below)."""
+        if self._outage_until is not None and self.assets.clock.now >= self._outage_until:
+            self._outage_until = None
+            self.grid_connected = True
+
         row = household_day.step_scenario(
-            self.assets, self._step_seconds, grid_connected=self.grid_connected
+            self.assets,
+            self._step_seconds,
+            grid_connected=self.grid_connected,
+            overrides=self._overrides,
+            disturbances=self._disturbances,
         )
+        # Dashboard-only: whether the current disconnect is a *timed*
+        # disturbance (`trigger_outage`) as opposed to the plain manual
+        # grid-connect toggle staying off indefinitely — both already show up
+        # in `grid_connected`, this just distinguishes why.
+        row["outage_disturbance_active"] = float(self._outage_until is not None)
         timestamp = datetime.fromisoformat(row["timestamp"])
 
         # Forecast this tick from history recorded *before* it, then only

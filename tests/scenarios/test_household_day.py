@@ -18,6 +18,8 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 from microgridmanager.protection import PROTECTION_STATE_CODES, ProtectionState
 from simulation.runner import write_csv
 from simulation.scenarios import household_day
@@ -236,6 +238,209 @@ def test_dispatch_active_flag_tracks_grid_availability() -> None:
             float(PROTECTION_STATE_CODES[ProtectionState.RESTORATION]),
         )
         assert row["dispatch_active"] == float(expected_active)
+
+
+def test_manual_overrides_are_applied_while_grid_connected() -> None:
+    """M9 exit-criteria test (applied case): battery/EV/water-heater manual
+    overrides take effect while the site is in a state (NORMAL, here) that
+    permits them, and each device's actual reading reflects the requested
+    setpoint rather than dispatch's/the fallback rule's own decision."""
+    assets = household_day.build_scenario(step_seconds=300.0)
+    overrides = household_day.ManualOverrides(
+        battery_power_w=1_000.0, ev_power_w=500.0, water_heater_force_heating=True
+    )
+
+    row = household_day.step_scenario(
+        assets, 300.0, grid_connected=True, dispatch_enabled=False, overrides=overrides
+    )
+
+    assert row["battery_override_active"] == 1.0
+    assert row["battery_override_applied"] == 1.0
+    assert row["battery_power_w"] == pytest.approx(1_000.0, rel=1e-3)
+
+    assert row["ev_override_active"] == 1.0
+    assert row["ev_override_applied"] == 1.0
+    assert row["ev_power_w"] == pytest.approx(500.0, rel=1e-3)
+
+    assert row["water_heater_override_active"] == 1.0
+    assert row["water_heater_override_applied"] == 1.0
+    assert row["water_heater_heating"] == 1.0
+
+
+def test_manual_overrides_are_rejected_while_islanded() -> None:
+    """M9 exit-criteria test (rejected case): the same overrides, requested
+    throughout a scripted grid outage, are visibly rejected (active but not
+    applied) for the entire time the site isn't grid-connected — the manual
+    override path is routed through the same protection gate as automated
+    control, not a side door around it — and go back to being applied once
+    the grid (and NORMAL operation) returns."""
+    start = household_day.DEFAULT_START
+    outage_start = start + timedelta(hours=1)
+    outage_end = start + timedelta(hours=5)
+    grid_connected_at = household_day.grid_outage_between(outage_start, outage_end)
+    overrides = household_day.ManualOverrides(
+        battery_power_w=1_000.0, ev_power_w=1_000.0, water_heater_force_heating=True
+    )
+
+    assets = household_day.build_scenario(start=start, step_seconds=300.0)
+    step_seconds = 300.0
+    num_steps = int(8 * 3600.0 / step_seconds)
+    rows = []
+    for _ in range(num_steps):
+        grid_connected = grid_connected_at(assets.clock.now)
+        rows.append(
+            household_day.step_scenario(
+                assets,
+                step_seconds,
+                grid_connected=grid_connected,
+                dispatch_enabled=False,
+                overrides=overrides,
+            )
+        )
+        assets.clock.tick()
+
+    not_grid_connected_states = {
+        PROTECTION_STATE_CODES[ProtectionState.ISLANDING_TRANSITION],
+        PROTECTION_STATE_CODES[ProtectionState.ISLANDED],
+        PROTECTION_STATE_CODES[ProtectionState.BLACK_START],
+    }
+    islanded_rows = [row for row in rows if row["protection_state"] in not_grid_connected_states]
+    normal_rows = [
+        row
+        for row in rows
+        if row["protection_state"] == PROTECTION_STATE_CODES[ProtectionState.NORMAL]
+    ]
+    assert islanded_rows, "scenario should spend time off-grid during the scripted outage"
+    assert normal_rows, "scenario should also spend time grid-connected"
+
+    for row in islanded_rows:
+        assert row["battery_override_active"] == 1.0
+        assert row["battery_override_applied"] == 0.0
+        assert row["ev_override_active"] == 1.0
+        assert row["ev_override_applied"] == 0.0
+        assert row["water_heater_override_active"] == 1.0
+        assert row["water_heater_override_applied"] == 0.0
+
+    for row in normal_rows:
+        # The battery itself may be too depleted after the outage to fully
+        # honor 1000W (the adapter correctly clamps to available energy —
+        # see `SimulatedBatteryAdapter.step`), so check the EV override's
+        # exact value instead: its state of charge is untouched by the
+        # outage, so nothing should clamp it here.
+        assert row["battery_override_applied"] == 1.0
+        assert row["ev_override_applied"] == 1.0
+        assert row["ev_power_w"] == pytest.approx(1_000.0, rel=1e-3)
+        assert row["water_heater_override_applied"] == 1.0
+        assert row["water_heater_heating"] == 1.0
+
+
+def test_load_disturbance_scales_household_demand() -> None:
+    """A load-multiplier disturbance should scale household demand relative
+    to what the same tick would draw with no disturbance active."""
+    assets = household_day.build_scenario(step_seconds=300.0)
+    baseline_row = household_day.step_scenario(assets, 300.0, dispatch_enabled=False)
+
+    assets = household_day.build_scenario(step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(load_multiplier=2.0)
+    row = household_day.step_scenario(
+        assets, 300.0, dispatch_enabled=False, disturbances=disturbances
+    )
+
+    assert row["load_disturbance_active"] == 1.0
+    assert row["load_disturbance_multiplier"] == pytest.approx(2.0)
+    assert row["household_load_power_w"] == pytest.approx(
+        baseline_row["household_load_power_w"] * 2.0, rel=1e-3
+    )
+
+
+def test_pv_disturbance_scales_pv_output() -> None:
+    """A pv-multiplier disturbance ("clouds") should scale PV output
+    relative to the same tick with no disturbance active."""
+    start = household_day.DEFAULT_START + timedelta(hours=12)  # midday, PV actually producing
+    assets = household_day.build_scenario(start=start, step_seconds=300.0)
+    baseline_row = household_day.step_scenario(assets, 300.0, dispatch_enabled=False)
+    assert baseline_row["pv_power_w"] > 0.0
+
+    assets = household_day.build_scenario(start=start, step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(pv_multiplier=0.3)
+    row = household_day.step_scenario(
+        assets, 300.0, dispatch_enabled=False, disturbances=disturbances
+    )
+
+    assert row["pv_disturbance_active"] == 1.0
+    assert row["pv_disturbance_multiplier"] == pytest.approx(0.3)
+    assert row["pv_power_w"] == pytest.approx(baseline_row["pv_power_w"] * 0.3, rel=1e-3)
+
+
+def test_disturbance_expires_after_its_duration() -> None:
+    """A disturbance with a `*_until` in the past should no longer be
+    active/applied, restoring normal behavior automatically."""
+    start = household_day.DEFAULT_START + timedelta(hours=12)
+    assets = household_day.build_scenario(start=start, step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(
+        pv_multiplier=0.1, pv_multiplier_until=start  # already expired at tick time
+    )
+
+    row = household_day.step_scenario(
+        assets, 300.0, dispatch_enabled=False, disturbances=disturbances
+    )
+
+    assert row["pv_disturbance_active"] == 0.0
+    assert row["pv_power_w"] > 0.0  # normal midday output, not scaled down
+
+
+def test_demand_response_caps_grid_import() -> None:
+    """A demand-response disturbance should cap grid import while dispatch is
+    active, with the battery covering the rest of the shortfall instead."""
+    start = household_day.DEFAULT_START  # midnight: no PV, so import is otherwise needed
+    assets = household_day.build_scenario(start=start, step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(max_import_w=100.0)
+
+    row = household_day.step_scenario(
+        assets, 300.0, dispatch_enabled=True, disturbances=disturbances
+    )
+
+    assert row["dispatch_active"] == 1.0
+    assert row["demand_response_active"] == 1.0
+    assert row["demand_response_cap_w"] == pytest.approx(100.0)
+    assert row["grid_power_w"] <= 100.0 + 1e-3
+
+
+def test_demand_response_has_no_effect_while_islanded() -> None:
+    """A demand-response cap only constrains dispatch's LP — while islanded
+    there's no grid exchange for it to cap in the first place, so it's
+    reported as requested (`demand_response_active`) but has no bearing on
+    the (forced-zero) grid power."""
+    assets = household_day.build_scenario(step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(max_import_w=100.0)
+
+    row = household_day.step_scenario(
+        assets, 300.0, grid_connected=False, dispatch_enabled=True, disturbances=disturbances
+    )
+
+    assert row["dispatch_active"] == 0.0
+    assert row["demand_response_active"] == 1.0
+    assert row["grid_power_w"] == 0.0
+
+
+def test_demand_response_cap_never_crashes_dispatch_over_many_ticks() -> None:
+    """Regression test: an aggressive, indefinitely-active demand-response
+    cap combined with the EV's own overnight charging deadline can leave the
+    LP no feasible plan for some tick even after `_clamped_import_caps`'
+    battery-rated-power-only clamp (it doesn't account for the battery's
+    remaining energy or the EV's target-SoC constraints) — `step_scenario`
+    must fall back to an uncapped dispatch rather than let
+    `DispatchInfeasibleError` propagate and crash the tick."""
+    assets = household_day.build_scenario(step_seconds=300.0)
+    disturbances = household_day.ScenarioDisturbances(max_import_w=300.0)
+
+    for _ in range(60):
+        row = household_day.step_scenario(
+            assets, 300.0, dispatch_enabled=True, disturbances=disturbances
+        )
+        assets.clock.tick()
+
+    assert row["timestamp"]  # reached the last tick without raising
 
 
 def test_write_csv_produces_a_readable_file_with_all_rows(tmp_path: Path) -> None:

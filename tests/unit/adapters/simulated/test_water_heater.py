@@ -110,6 +110,76 @@ def test_unshedding_resumes_normal_hysteresis_control() -> None:
     assert heater.get_state().heating is True
 
 
+def test_manual_override_forces_heating_on_above_high_threshold() -> None:
+    heater = SimulatedWaterHeaterAdapter(
+        "wh-1",
+        capacity_wh=1_000.0,
+        rated_power_w=1_000.0,
+        initial_tank_fraction=1.0,
+        low_fraction=0.4,
+        high_fraction=0.9,
+        draw_profile=lambda _at: 0.0,
+    )
+    heater.set_manual_heating_override(True)
+    heater.step(600.0)  # tank is already full, hysteresis alone would stay off
+
+    state = heater.get_state()
+    assert state.heating is True
+    assert state.active_power_w == 1_000.0
+
+
+def test_manual_override_forces_heating_off_below_low_threshold() -> None:
+    heater = SimulatedWaterHeaterAdapter(
+        "wh-1",
+        capacity_wh=1_000.0,
+        rated_power_w=1_000.0,
+        initial_tank_fraction=0.3,
+        low_fraction=0.4,
+        high_fraction=0.9,
+        draw_profile=lambda _at: 0.0,
+    )
+    heater.set_manual_heating_override(False)
+    heater.step(600.0)  # tank is already below low_fraction, hysteresis alone would kick in
+
+    state = heater.get_state()
+    assert state.heating is False
+    assert state.active_power_w == 0.0
+
+
+def test_shed_wins_over_a_manual_heating_override() -> None:
+    heater = SimulatedWaterHeaterAdapter(
+        "wh-1",
+        capacity_wh=1_000.0,
+        rated_power_w=1_000.0,
+        initial_tank_fraction=0.3,
+        draw_profile=lambda _at: 0.0,
+    )
+    heater.set_shed(True)
+    heater.set_manual_heating_override(True)
+    heater.step(600.0)
+
+    assert heater.get_state().heating is False
+
+
+def test_clearing_a_manual_override_resumes_normal_hysteresis() -> None:
+    heater = SimulatedWaterHeaterAdapter(
+        "wh-1",
+        capacity_wh=1_000.0,
+        rated_power_w=1_000.0,
+        initial_tank_fraction=1.0,
+        low_fraction=0.4,
+        high_fraction=0.9,
+        draw_profile=lambda _at: 0.0,
+    )
+    heater.set_manual_heating_override(True)
+    heater.step(600.0)
+    assert heater.get_state().heating is True
+
+    heater.set_manual_heating_override(None)
+    heater.step(600.0)  # tank is still full, so hysteresis alone should turn it back off
+    assert heater.get_state().heating is False
+
+
 def test_timestamp_reflects_shared_clock() -> None:
     clock = SimulationClock()
     heater = SimulatedWaterHeaterAdapter("wh-1", clock=clock)

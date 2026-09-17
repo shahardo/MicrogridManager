@@ -54,6 +54,95 @@
     <div class="device-cards" id="decision-cards"></div>
   </section>
 
+  <section id="overrides-panel" class="panel">
+    <h2>Manual overrides (M9)</h2>
+    <p class="hint">
+      Overrides are routed through the same protection gate as automated
+      control (M5) — one that isn't currently safe (e.g. a shed load, or
+      during an islanding/black-start transition) is rejected, visible in
+      the "Manual overrides" decision card above.
+    </p>
+    <div class="controls-row">
+      <label>Battery power (W, + discharge / - charge)
+        <input id="battery-override-input" type="number" step="100" placeholder="auto" />
+      </label>
+      <button id="battery-override-set">Set</button>
+      <button id="battery-override-clear">Clear</button>
+    </div>
+    <div class="controls-row">
+      <label>EV charger power (W)
+        <input id="ev-override-input" type="number" step="100" min="0" placeholder="auto" />
+      </label>
+      <button id="ev-override-set">Set</button>
+      <button id="ev-override-clear">Clear</button>
+    </div>
+    <div class="controls-row">
+      <label>Water heater
+        <select id="water-heater-override-select">
+          <option value="auto">Auto</option>
+          <option value="on">Force on</option>
+          <option value="off">Force off</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <section id="disturbances-panel" class="panel">
+    <h2>Simulation disturbances</h2>
+    <p class="hint">
+      Inject environmental/external swings into the running simulation and
+      watch protection/dispatch react — separate from the manual overrides
+      above, which instead dictate a device's setpoint directly.
+    </p>
+    <div class="controls-row">
+      <label>Outage duration (min)
+        <input id="outage-input" type="number" min="1" step="1" placeholder="10" />
+      </label>
+      <button id="outage-trigger">Trigger outage</button>
+      <button id="outage-clear">Reconnect now</button>
+    </div>
+    <div class="controls-row">
+      <label>Household demand multiplier (1.0 = normal)
+        <input id="load-disturbance-input" type="number" step="0.1" min="0" placeholder="1.0" />
+      </label>
+      <label>Duration (min, blank = indefinite)
+        <input id="load-disturbance-duration" type="number" min="1" step="1" />
+      </label>
+      <button id="load-disturbance-set">Set</button>
+      <button id="load-disturbance-clear">Clear</button>
+    </div>
+    <div class="controls-row">
+      <label>PV output multiplier / clouds (1.0 = normal)
+        <input id="pv-disturbance-input" type="number" step="0.1" min="0" placeholder="1.0" />
+      </label>
+      <label>Duration (min, blank = indefinite)
+        <input id="pv-disturbance-duration" type="number" min="1" step="1" />
+      </label>
+      <button id="pv-disturbance-set">Set</button>
+      <button id="pv-disturbance-clear">Clear</button>
+    </div>
+    <div class="controls-row">
+      <label>Demand response grid-import cap (W)
+        <input id="dr-disturbance-input" type="number" step="100" min="0" placeholder="none" />
+      </label>
+      <label>Duration (min, blank = indefinite)
+        <input id="dr-disturbance-duration" type="number" min="1" step="1" />
+      </label>
+      <button id="dr-disturbance-set">Set</button>
+      <button id="dr-disturbance-clear">Clear</button>
+    </div>
+  </section>
+
+  <section id="device-adapters-panel" class="panel">
+    <h2>Device adapters</h2>
+    <p class="hint">
+      Every device runs the simulated adapter for now — the real/simulated
+      selector below is wired up and ready, but a real Modbus/SunSpec
+      adapter to select isn't implemented yet.
+    </p>
+    <div class="device-cards" id="device-adapter-cards"></div>
+  </section>
+
   <section class="panel">
     <div class="charts-header">
       <h2>Charts</h2>

@@ -166,12 +166,22 @@ class DispatchEngine:
         battery: BatteryState,
         tariff_at: Callable[[datetime], tuple[float, float]],
         ev: EVChargingState | None = None,
+        max_import_w: list[float] | None = None,
     ) -> DispatchPlan:
         """Forecast the horizon from history recorded strictly before `now`,
         solve the LP, record `now`'s actuals for future calls, and return the
         plan. `tariff_at(t)` must return `(import_price_per_kwh,
         export_price_per_kwh)` for an arbitrary future time — e.g.
-        `SimulatedGridConnectionAdapter.peek_price`."""
+        `SimulatedGridConnectionAdapter.peek_price`.
+
+        `max_import_w`, if given, is a per-horizon-step cap (same indexing as
+        the forecasts — index 0 is the step after `now`) on how much power
+        may be imported from the grid — the dashboard's "demand response"
+        disturbance control, letting the LP proactively shift to
+        battery/EV usage around the constrained window instead of a post-hoc
+        clamp that would leave an unphysical energy shortfall. `None` (the
+        default) leaves grid import unconstrained, as before this parameter
+        existed."""
         pv_forecast = self._forecast_horizon(
             self._pv_forecaster, self._pv_history, now, pv_actual_w
         )
@@ -195,6 +205,7 @@ class DispatchEngine:
             export_prices=export_prices,
             battery=battery,
             ev=ev,
+            max_import_w=max_import_w,
         )
 
         # Only recorded *after* forecasting/solving — a forecaster must never
@@ -233,6 +244,28 @@ def _clamped_ev_targets(
     return clamped
 
 
+def _clamped_import_caps(
+    max_import_w: list[float],
+    pv_forecast_w: list[float],
+    load_forecast_w: list[float],
+    battery: BatteryState,
+) -> list[float]:
+    """Raise an unreachably-low demand-response import cap just enough to
+    keep the tick feasible, same rationale as `_clamped_ev_targets`: a step
+    whose forecasted load exceeds PV plus the battery's full rated power
+    simply cannot be served under the requested cap without more supply than
+    physically exists, so this floors each step's cap at that worst-case
+    minimum rather than letting the whole tick's LP go infeasible over one
+    unreachable step."""
+    clamped = []
+    for k, cap in enumerate(max_import_w):
+        min_feasible_import_w = max(
+            0.0, load_forecast_w[k] - pv_forecast_w[k] - battery.rated_power_w
+        )
+        clamped.append(max(cap, min_feasible_import_w))
+    return clamped
+
+
 def _solve(
     *,
     horizon_steps: int,
@@ -243,6 +276,7 @@ def _solve(
     export_prices: list[float],
     battery: BatteryState,
     ev: EVChargingState | None,
+    max_import_w: list[float] | None = None,
 ) -> tuple[list[float], list[float] | None, float]:
     problem = pulp.LpProblem("economic_dispatch", pulp.LpMinimize)
 
@@ -254,7 +288,25 @@ def _solve(
         pulp.LpVariable(f"batt_discharge_{k}", lowBound=0, upBound=battery.rated_power_w)
         for k in range(horizon_steps)
     ]
-    grid_import = [pulp.LpVariable(f"grid_import_{k}", lowBound=0) for k in range(horizon_steps)]
+    # A per-step demand-response import cap is just a tighter upBound on the
+    # same variable the LP already solves for — the solver naturally shifts
+    # to battery/EV usage around a constrained step rather than needing a
+    # separate mechanism. Clamped first so an unreachably-low requested cap
+    # degrades to "as low as physically achievable" instead of making the
+    # whole tick's LP infeasible.
+    import_caps = (
+        _clamped_import_caps(max_import_w, pv_forecast_w, load_forecast_w, battery)
+        if max_import_w is not None
+        else None
+    )
+    grid_import = [
+        pulp.LpVariable(
+            f"grid_import_{k}",
+            lowBound=0,
+            upBound=import_caps[k] if import_caps is not None else None,
+        )
+        for k in range(horizon_steps)
+    ]
     grid_export = [pulp.LpVariable(f"grid_export_{k}", lowBound=0) for k in range(horizon_steps)]
 
     ev_charge = None

@@ -52,3 +52,52 @@ def test_pv_output_never_exceeds_rated_power() -> None:
     for _ in range(48):
         assert 0.0 <= pv.get_state().active_power_w <= rated_power_w
         clock.tick()
+
+
+def test_output_multiplier_scales_output() -> None:
+    sunrise, sunset = 6.0, 18.0
+    noon = (sunrise + sunset) / 2
+    clock = _clock_at(int(noon))
+    pv = SimulatedPVAdapter(
+        "pv-1",
+        clock=clock,
+        rated_power_w=5_000.0,
+        irradiance_profile=daylight_irradiance_profile(sunrise, sunset),
+    )
+    pv.set_output_multiplier(0.25)
+    assert pv.get_state().active_power_w == pytest.approx(1_250.0, rel=1e-6)
+
+
+def test_output_multiplier_clamps_to_rated_power() -> None:
+    sunrise, sunset = 6.0, 18.0
+    noon = (sunrise + sunset) / 2
+    clock = _clock_at(int(noon))
+    pv = SimulatedPVAdapter(
+        "pv-1",
+        clock=clock,
+        rated_power_w=5_000.0,
+        irradiance_profile=daylight_irradiance_profile(sunrise, sunset),
+    )
+    pv.set_output_multiplier(2.0)
+    assert pv.get_state().active_power_w == pytest.approx(5_000.0, rel=1e-6)
+
+
+def test_clearing_output_multiplier_restores_profile_driven_output() -> None:
+    sunrise, sunset = 6.0, 18.0
+    noon = (sunrise + sunset) / 2
+    clock = _clock_at(int(noon))
+    pv = SimulatedPVAdapter(
+        "pv-1",
+        clock=clock,
+        rated_power_w=5_000.0,
+        irradiance_profile=daylight_irradiance_profile(sunrise, sunset),
+    )
+    pv.set_output_multiplier(0.1)
+    pv.set_output_multiplier(1.0)
+    assert pv.get_state().active_power_w == pytest.approx(5_000.0, rel=1e-6)
+
+
+def test_negative_output_multiplier_is_rejected() -> None:
+    pv = SimulatedPVAdapter("pv-1", clock=_clock_at(12))
+    with pytest.raises(ValueError):
+        pv.set_output_multiplier(-0.5)
